@@ -1,0 +1,81 @@
+# alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
+# fired alert to http://alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
+# calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image is a placeholder
+# (ghcr.io/braghettos/alert-troubleshooter:dev) — swap for the pushed tag.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alert-troubleshooter
+  namespace: krateo-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alert-troubleshooter
+  namespace: krateo-system
+rules:
+  - apiGroups: ["observability.krateo.io"]
+    resources: ["troubleshootingreports", "troubleshootingreports/status"]
+    verbs: ["create", "get", "list", "patch", "update"]
+  # read Alert CRs for context (best-effort enrichment)
+  - apiGroups: ["hyperdx.ogen.krateo.io"]
+    resources: ["alerts"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alert-troubleshooter
+  namespace: krateo-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: alert-troubleshooter
+subjects:
+  - kind: ServiceAccount
+    name: alert-troubleshooter
+    namespace: krateo-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-troubleshooter
+  namespace: krateo-system
+  labels: { app: alert-troubleshooter }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: alert-troubleshooter }
+  template:
+    metadata:
+      labels: { app: alert-troubleshooter }
+    spec:
+      serviceAccountName: alert-troubleshooter
+      containers:
+        - name: handler
+          image: ghcr.io/braghettos/alert-troubleshooter:dev
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NAMESPACE
+              value: krateo-system
+            - name: AUTOPILOT_A2A_URL
+              value: http://krateo-autopilot.krateo-system.svc:8080/
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-troubleshooter
+  namespace: krateo-system
+spec:
+  selector: { app: alert-troubleshooter }
+  ports:
+    - port: 8080
+      targetPort: 8080
