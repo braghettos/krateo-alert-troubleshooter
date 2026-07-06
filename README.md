@@ -1,10 +1,10 @@
-# alert-troubleshooter
+# krateo-alert-troubleshooter
 
 Bridges a **HyperDX alert** to an **Autopilot root-cause analysis**, in the background — no
 browser required. The "auto-troubleshoot on fire" path for the Krateo observability Alerts.
 
 ```
-HyperDX alert fires → webhook → alert-troubleshooter → A2A call to krateo-autopilot
+HyperDX alert fires → webhook → krateo-alert-troubleshooter → A2A call to krateo-autopilot
                                                       → TroubleshootingReport CR (status.report = analysis)
                                                       → portal Alerts section renders it
 ```
@@ -20,14 +20,14 @@ Acks the webhook immediately (202) and analyses in a background thread so HyperD
 
 ## Build
 Image is built + pushed by CI (`.github/workflows/release.yaml`) to
-`ghcr.io/braghettos/alert-troubleshooter` on push to `main` / tags. No local docker push.
+`ghcr.io/braghettos/krateo-alert-troubleshooter` on push to `main` / tags. No local docker push.
 
 ## Deploy
 ```sh
 kubectl apply -f crd.troubleshootingreport.yaml   # the report CRD
 kubectl apply -f deploy.yaml                       # SA + RBAC + Deployment + Service
 ```
-Then point a HyperDX webhook at `http://alert-troubleshooter.krateo-system.svc:8080/webhook`
+Then point a HyperDX webhook at `http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook`
 and reference it as the `channel.webhookId` on your `Alert` CRs.
 
 ## Config (env)

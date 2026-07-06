@@ -1,17 +1,17 @@
-# alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
-# fired alert to http://alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
+# krateo-alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
+# fired alert to http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
 # calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image is a placeholder
-# (ghcr.io/braghettos/alert-troubleshooter:dev) — swap for the pushed tag.
+# (ghcr.io/braghettos/krateo-alert-troubleshooter:dev) — swap for the pushed tag.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: alert-troubleshooter
+  name: krateo-alert-troubleshooter
   namespace: krateo-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: alert-troubleshooter
+  name: krateo-alert-troubleshooter
   namespace: krateo-system
 rules:
   - apiGroups: ["observability.krateo.io"]
@@ -25,35 +25,35 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: alert-troubleshooter
+  name: krateo-alert-troubleshooter
   namespace: krateo-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: alert-troubleshooter
+  name: krateo-alert-troubleshooter
 subjects:
   - kind: ServiceAccount
-    name: alert-troubleshooter
+    name: krateo-alert-troubleshooter
     namespace: krateo-system
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: alert-troubleshooter
+  name: krateo-alert-troubleshooter
   namespace: krateo-system
-  labels: { app: alert-troubleshooter }
+  labels: { app: krateo-alert-troubleshooter }
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: alert-troubleshooter }
+    matchLabels: { app: krateo-alert-troubleshooter }
   template:
     metadata:
-      labels: { app: alert-troubleshooter }
+      labels: { app: krateo-alert-troubleshooter }
     spec:
-      serviceAccountName: alert-troubleshooter
+      serviceAccountName: krateo-alert-troubleshooter
       containers:
         - name: handler
-          image: ghcr.io/braghettos/alert-troubleshooter:dev
+          image: ghcr.io/braghettos/krateo-alert-troubleshooter:latest
           ports:
             - containerPort: 8080
           env:
@@ -72,10 +72,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: alert-troubleshooter
+  name: krateo-alert-troubleshooter
   namespace: krateo-system
 spec:
-  selector: { app: alert-troubleshooter }
+  # Headless: this bench cluster's ClusterIP range is exhausted; a headless service still
+  # resolves krateo-alert-troubleshooter.krateo-system.svc → the pod IP for HyperDX's webhook POST.
+  clusterIP: None
+  selector: { app: krateo-alert-troubleshooter }
   ports:
     - port: 8080
       targetPort: 8080

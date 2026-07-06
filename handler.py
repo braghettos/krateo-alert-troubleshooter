@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""alert-troubleshooter — bridges a HyperDX alert webhook to an Autopilot root-cause analysis.
+"""krateo-alert-troubleshooter — bridges a HyperDX alert webhook to an Autopilot root-cause analysis.
 
 On POST /webhook (HyperDX alert-fired payload):
   1. create a TroubleshootingReport CR (phase=Analyzing) via the apiserver,
@@ -146,5 +146,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
-    print(f"alert-troubleshooter listening on :{port} → A2A {AUTOPILOT_A2A}", flush=True)
+    print(f"krateo-alert-troubleshooter listening on :{port} → A2A {AUTOPILOT_A2A}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
