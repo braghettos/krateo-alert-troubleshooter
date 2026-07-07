@@ -39,6 +39,11 @@ class HyperDX:
         m = re.search(r"connect\.sid=([^;]+)", r.headers.get("set-cookie", ""))
         return m.group(1) if m else None
 
+    @staticmethod
+    def _redirect_ok(r):
+        loc = r.headers.get("Location", "")
+        return (300 <= r.status_code < 400 and "err" not in loc and "authFail" not in loc) or r.ok
+
     def login(self):
         """passport local login -> capture connect.sid. Returns True on success.
         A 303 to `/` (no err) is success; failures 303 to /login?err=authFail. Never follow the
@@ -46,12 +51,36 @@ class HyperDX:
         r = self.s.post(f"{self.url}/api/login/password",
                         json={"email": self.email, "password": self.password},
                         timeout=self.timeout, allow_redirects=False)
-        loc = r.headers.get("Location", "")
-        ok = (300 <= r.status_code < 400 and "err" not in loc and "authFail" not in loc) or r.ok
-        if not ok:
+        if not self._redirect_ok(r):
             return False
         self.sid = self._sid_from(r)
         return self.sid is not None
+
+    def register(self):
+        """Create the first admin + team (fresh install). Zod requires a matching confirmPassword
+        and a strong password (>=12 chars, upper+lower+digit+special)."""
+        r = self.s.post(f"{self.url}/api/register/password",
+                        json={"email": self.email, "password": self.password,
+                              "confirmPassword": self.password},
+                        timeout=self.timeout, allow_redirects=False)
+        if not self._redirect_ok(r):
+            return False
+        self.sid = self._sid_from(r)
+        return self.sid is not None
+
+    def ensure_session(self):
+        """Self-bootstrapping auth: register the admin on a fresh HyperDX (no team yet), else log
+        in. Returns True once a usable session cookie is held. Idempotent + race-safe."""
+        exists = True
+        try:
+            r = self.s.get(f"{self.url}/api/installation", timeout=self.timeout)
+            if r.ok:
+                exists = r.json().get("isTeamExisting", False)
+        except requests.RequestException:
+            pass
+        if not exists and self.register() and self.sid:
+            return True
+        return self.login()
 
     def _headers(self):
         return {"Cookie": f"connect.sid={self.sid}", "Content-Type": "application/json"}

@@ -128,10 +128,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok" if self.path == "/healthz" else b"")
 
     def do_POST(self):
-        if self.path != "/webhook":
-            self.send_response(404); self.end_headers(); return
+        # Accept any POST path as a webhook: HyperDX redacts the webhook URL path to `/****` in
+        # its API and may deliver to a redacted/normalised path, so we don't gate on "/webhook".
         length = int(self.headers.get("Content-Length", 0) or 0)
         raw = self.rfile.read(length) if length else b"{}"
+        print(f"[webhook] POST {self.path} ({length}B)", flush=True)  # observe the delivered path
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError:
