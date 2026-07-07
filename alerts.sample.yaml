@@ -1,0 +1,28 @@
+# Default Krateo observability Alert CRs. The reconciler in krateo-alert-troubleshooter turns each
+# into a HyperDX dashboard-tile + alert whose webhook fires the Autopilot auto-troubleshooter.
+# Tune thresholds per environment. These count rows of the logs source over the interval.
+apiVersion: observability.krateo.io/v1alpha1
+kind: Alert
+metadata:
+  name: error-log-volume
+  namespace: krateo-system
+spec:
+  displayName: "Error log volume"
+  where: "SeverityText:error OR SeverityText:Error OR SeverityText:ERROR"
+  interval: "5m"
+  threshold: 1
+  thresholdType: above
+  message: "Error-log volume is elevated on the Krateo platform — Autopilot will auto-triage the root cause."
+---
+apiVersion: observability.krateo.io/v1alpha1
+kind: Alert
+metadata:
+  name: warning-log-volume
+  namespace: krateo-system
+spec:
+  displayName: "Warning log volume"
+  where: "SeverityText:warn OR SeverityText:warning OR SeverityText:WARN"
+  interval: "15m"
+  threshold: 25
+  thresholdType: above
+  message: "Warning-log volume crossed the threshold — Autopilot will summarise likely causes."

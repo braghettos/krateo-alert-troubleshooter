@@ -145,6 +145,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Background: reconcile Alert CRs -> HyperDX (config + status) via the session API.
+    if os.environ.get("RECONCILER_ENABLED", "true").lower() == "true":
+        import reconciler  # imported here so the webhook path has no hard dep on it
+        threading.Thread(target=reconciler.run_forever, daemon=True).start()
     port = int(os.environ.get("PORT", "8080"))
     print(f"krateo-alert-troubleshooter listening on :{port} → A2A {AUTOPILOT_A2A}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

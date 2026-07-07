@@ -1,0 +1,89 @@
+# Alert (alerts.observability.krateo.io) — desired HyperDX alert, reconciled by the session-driven
+# reconciler in krateo-alert-troubleshooter (KOG can't manage HyperDX v2.27's session-only API).
+# spec = what to alert on; status mirrors the live HyperDX alert state.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: alerts.observability.krateo.io
+spec:
+  group: observability.krateo.io
+  scope: Namespaced
+  names:
+    kind: Alert
+    listKind: AlertList
+    plural: alerts
+    singular: alert
+    categories: [krateo, observability]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: State
+          type: string
+          jsonPath: .status.state
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Interval
+          type: string
+          jsonPath: .spec.interval
+        - name: Threshold
+          type: number
+          jsonPath: .spec.threshold
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [interval, threshold, thresholdType]
+              properties:
+                displayName:
+                  type: string
+                  description: Alert name shown in HyperDX (defaults to metadata.name).
+                where:
+                  type: string
+                  default: ""
+                  description: >
+                    Lucene filter over the logs source counted by the alert (empty = all rows).
+                    e.g. 'SeverityText:error OR SeverityText:warn'.
+                interval:
+                  type: string
+                  enum: ["1m", "5m", "15m", "30m", "1h", "6h", "12h", "1d"]
+                  default: "5m"
+                  description: Evaluation window.
+                threshold:
+                  type: number
+                  description: Trigger value compared via thresholdType.
+                thresholdType:
+                  type: string
+                  enum: [above, below, above_exclusive, below_or_equal, equal, not_equal, between, not_between]
+                  default: above
+                message:
+                  type: string
+                  description: Notification message (markdown).
+            status:
+              type: object
+              properties:
+                hyperdxAlertId:
+                  type: string
+                hyperdxDashboardId:
+                  type: string
+                state:
+                  type: string
+                  description: Live HyperDX alert state (OK / ALERT / PENDING).
+                phase:
+                  type: string
+                  description: Reconcile phase (Pending / Synced / Error).
+                error:
+                  type: string
+                lastSyncedAt:
+                  type: string
+                  format: date-time

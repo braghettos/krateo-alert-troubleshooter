@@ -17,10 +17,10 @@ rules:
   - apiGroups: ["observability.krateo.io"]
     resources: ["troubleshootingreports", "troubleshootingreports/status"]
     verbs: ["create", "get", "list", "patch", "update"]
-  # read Alert CRs for context (best-effort enrichment)
-  - apiGroups: ["hyperdx.ogen.krateo.io"]
-    resources: ["alerts"]
-    verbs: ["get", "list"]
+  # the reconciler reads Alert CRs (desired) and writes their status (mirrored HyperDX state)
+  - apiGroups: ["observability.krateo.io"]
+    resources: ["alerts", "alerts/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   # the key-bootstrap Job (same SA) writes the hyperdx-api-token Secret
   - apiGroups: [""]
     resources: ["secrets"]
@@ -65,6 +65,15 @@ spec:
               value: krateo-system
             - name: AUTOPILOT_A2A_URL
               value: http://krateo-autopilot.krateo-system.svc:8080/
+            # --- reconciler (Alert CRs -> HyperDX session API) ---
+            - name: HYPERDX_URL
+              value: http://krateo-clickstack.krateo-system.svc:3000
+            - name: HYPERDX_ADMIN_EMAIL
+              valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: email } }
+            - name: HYPERDX_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: password } }
+            - name: RECONCILE_INTERVAL
+              value: "60"
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 3
