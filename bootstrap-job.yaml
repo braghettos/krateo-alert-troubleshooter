@@ -1,0 +1,43 @@
+# hyperdx-key-bootstrap — provisions the HyperDX team API key into the `hyperdx-api-token`
+# Secret headlessly (register/login → GET /api/team). The installer creates the admin-creds
+# Secret (generated password) and applies this Job; re-runs are safe (idempotent via
+# /api/installation). Uses the krateo-alert-troubleshooter SA (has secrets create/patch).
+#
+# The `hyperdx-admin-creds` Secret is NOT shipped here (never commit a password) — the
+# installer generates it, e.g.:
+#   kubectl create secret generic hyperdx-admin-creds -n krateo-system \
+#     --from-literal=email=admin@krateo.local --from-literal=password="$(openssl rand -hex 24)"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hyperdx-key-bootstrap
+  namespace: krateo-system
+spec:
+  backoffLimit: 6            # HyperDX may still be booting when the installer fires this
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: hyperdx-key-bootstrap }
+    spec:
+      serviceAccountName: krateo-alert-troubleshooter
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: ghcr.io/braghettos/krateo-alert-troubleshooter:latest
+          imagePullPolicy: Always
+          command: ["python", "bootstrap.py"]
+          env:
+            - name: HYPERDX_URL
+              value: http://krateo-clickstack.krateo-system.svc:3000
+            - name: NAMESPACE
+              value: krateo-system
+            - name: SECRET_NAME
+              value: hyperdx-api-token
+            - name: HYPERDX_ADMIN_EMAIL
+              valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: email } }
+            - name: HYPERDX_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: password } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: { drop: ["ALL"] }

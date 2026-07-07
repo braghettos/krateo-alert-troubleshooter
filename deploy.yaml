@@ -21,6 +21,10 @@ rules:
   - apiGroups: ["hyperdx.ogen.krateo.io"]
     resources: ["alerts"]
     verbs: ["get", "list"]
+  # the key-bootstrap Job (same SA) writes the hyperdx-api-token Secret
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
