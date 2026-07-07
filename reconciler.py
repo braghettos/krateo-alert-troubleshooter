@@ -9,8 +9,10 @@ in the krateo-alert-troubleshooter process:
     login (once; re-login on session expiry) ->
     ensure the shared webhook (-> this troubleshooter's /webhook) ->
     for each Alert CR:
-        no status.hyperdxAlertId -> create dashboard-tile + alert in HyperDX, record ids in status
-        else                      -> mirror the live alert state (OK/ALERT/PENDING) into status
+        being deleted (deletionTimestamp) -> delete its HyperDX alert+dashboard, drop the finalizer
+        else, no status.hyperdxAlertId    -> create dashboard-tile + alert, record ids in status
+        else                              -> mirror the live alert state (OK/ALERT/PENDING) to status
+    (a finalizer on each CR guarantees the HyperDX resources are removed before the CR is deleted)
 
 Alerts flow: HyperDX evaluates the alert; when it fires it POSTs the webhook -> this service's
 /webhook -> Autopilot RCA -> TroubleshootingReport. The reconciler only manages config + status.
@@ -29,6 +31,8 @@ INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "60"))
 WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "krateo-autopilot")
 WEBHOOK_TARGET = os.environ.get(
     "WEBHOOK_TARGET_URL", "http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook")
+# Added to each Alert CR so its HyperDX alert+dashboard are removed before the CR is deleted.
+FINALIZER = "observability.krateo.io/hyperdx-cleanup"
 
 
 def _list_alert_crs():
@@ -38,6 +42,34 @@ def _list_alert_crs():
 def _patch_status(name, status):
     _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{NAMESPACE}/{PLURAL}/{name}",
          {"status": status}, subresource="status")
+
+
+def _patch_finalizers(name, finalizers):
+    _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{NAMESPACE}/{PLURAL}/{name}",
+         {"metadata": {"finalizers": finalizers}})
+
+
+def _ensure_finalizer(cr):
+    fins = cr["metadata"].get("finalizers") or []
+    if FINALIZER not in fins:
+        _patch_finalizers(cr["metadata"]["name"], fins + [FINALIZER])
+
+
+def _finalize(hdx, cr):
+    """The CR is being deleted (deletionTimestamp set): delete its HyperDX alert + dashboard, then
+    drop our finalizer so Kubernetes can complete the deletion. Best-effort on the HyperDX side."""
+    meta, status = cr["metadata"], cr.get("status", {})
+    name = meta["name"]
+    for delete_fn, key in ((hdx.delete_alert, "hyperdxAlertId"),
+                           (hdx.delete_dashboard, "hyperdxDashboardId")):
+        oid = status.get(key)
+        if oid:
+            try:
+                delete_fn(oid)
+            except Exception:  # noqa: BLE001 — still drop the finalizer so delete isn't wedged
+                pass
+    _patch_finalizers(name, [f for f in (meta.get("finalizers") or []) if f != FINALIZER])
+    print(f"[reconciler] finalized Alert {name} (removed HyperDX alert+dashboard)", flush=True)
 
 
 def _reconcile_cr(hdx, cr, source, webhook_id):
@@ -71,18 +103,22 @@ def reconcile_once(hdx):
     if recreated:
         # the webhook id changed -> alerts referencing the old id would notify a dead channel.
         # Drop the HyperDX alerts we manage + reset their CR status so they rebuild on this webhook.
-        crs = _list_alert_crs()
-        managed = {cr.get("status", {}).get("hyperdxAlertId") for cr in crs} - {None, ""}
+        active = [cr for cr in _list_alert_crs() if not cr["metadata"].get("deletionTimestamp")]
+        managed = {cr.get("status", {}).get("hyperdxAlertId") for cr in active} - {None, ""}
         for a in hdx.list_alerts():
             if a["_id"] in managed:
                 try:
                     hdx.delete_alert(a["_id"])
                 except Exception:  # noqa: BLE001
                     pass
-        for cr in crs:
+        for cr in active:
             _patch_status(cr["metadata"]["name"], {"hyperdxAlertId": None, "phase": "Pending"})
     for cr in _list_alert_crs():
         try:
+            if cr["metadata"].get("deletionTimestamp"):
+                _finalize(hdx, cr)      # CR is being deleted -> clean up HyperDX + drop finalizer
+                continue
+            _ensure_finalizer(cr)       # guard the CR so its HyperDX resources are cleaned on delete
             _reconcile_cr(hdx, cr, source, webhook_id)
         except requests.HTTPError:
             raise  # bubble 401/session issues to the loop for re-login

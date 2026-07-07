@@ -25,6 +25,11 @@ APISERVER = os.environ.get("APISERVER", "https://kubernetes.default.svc")
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 GROUP, VERSION, PLURAL = "observability.krateo.io", "v1alpha1", "troubleshootingreports"
 A2A_TIMEOUT = int(os.environ.get("A2A_TIMEOUT", "180"))
+# HyperDX notifies every eval while an alert stays breached; dedup so we don't spam a new report
+# each interval. Skip if one for the same alert is in-flight, or was created within this window.
+REPORT_COOLDOWN = int(os.environ.get("REPORT_COOLDOWN", "1800"))
+
+_create_lock = threading.Lock()  # serialize the dedup-check + create so simultaneous fires don't race
 
 
 def _now():
@@ -75,6 +80,28 @@ def patch_status(ns, name, status):
     _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}", {"status": status}, subresource="status")
 
 
+def _recent_report(alert_name, ns):
+    """Dedup: True if a report for this alert is still Pending/Analyzing, or was created within
+    REPORT_COOLDOWN seconds. Keeps a perpetually-breached alert from spawning a report every eval."""
+    try:
+        items = _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}").get("items", [])
+    except Exception:  # noqa: BLE001 — on a list error, don't block the report
+        return False
+    now = datetime.now(timezone.utc)
+    for r in items:
+        if (r.get("spec") or {}).get("alertName") != alert_name:
+            continue
+        if (r.get("status") or {}).get("phase") in ("Pending", "Analyzing"):
+            return True
+        ts = r.get("metadata", {}).get("creationTimestamp")
+        try:
+            if ts and (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() < REPORT_COOLDOWN:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
 def a2a_analyze(prompt):
     """POST JSON-RPC message/stream to the Autopilot A2A agent; accumulate the agent's text."""
     body = {"id": 1, "jsonrpc": "2.0", "method": "message/stream", "params": {"message": {
@@ -119,7 +146,12 @@ def process(payload):
     alert_state = payload.get("state") or payload.get("status") or "ALERT"
     alert_ns = payload.get("alertNamespace") or NAMESPACE
     prompt = build_prompt(alert_name, alert_state)
-    ns, name = create_report(alert_name, alert_ns, alert_state, alert_id, prompt)
+    # Dedup under a lock: skip if a report for this alert is in-flight or within the cooldown.
+    with _create_lock:
+        if _recent_report(alert_name, alert_ns):
+            print(f"[dedup] recent/in-flight report for {alert_name!r}; skipping", flush=True)
+            return
+        ns, name = create_report(alert_name, alert_ns, alert_state, alert_id, prompt)
     try:
         report = a2a_analyze(prompt) or "_Autopilot returned no analysis._"
         patch_status(ns, name, {"phase": "Ready", "report": report, "completedAt": _now()})

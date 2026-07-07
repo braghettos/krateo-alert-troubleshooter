@@ -65,6 +65,8 @@ spec:
               value: krateo-system
             - name: AUTOPILOT_A2A_URL
               value: http://krateo-autopilot.krateo-system.svc:8080/
+            - name: REPORT_COOLDOWN
+              value: "1800"     # dedup window (s): don't re-analyze the same alert within this
             # --- reconciler (Alert CRs -> HyperDX session API) ---
             - name: HYPERDX_URL
               value: http://krateo-clickstack.krateo-system.svc:3000

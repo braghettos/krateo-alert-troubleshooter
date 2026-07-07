@@ -127,6 +127,9 @@ class HyperDX:
     def delete_alert(self, alert_id):
         self._req("DELETE", f"/api/alerts/{alert_id}")
 
+    def delete_dashboard(self, dashboard_id):
+        self._req("DELETE", f"/api/dashboards/{dashboard_id}")
+
     def ensure_dashboard_tile(self, name, source, where=""):
         """Ensure a single-tile dashboard `name` counting rows of `source` matching `where`.
         Returns (dashboardId, tileId). The tile config mirrors the verified working shape."""
