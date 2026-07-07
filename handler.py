@@ -10,6 +10,7 @@ Runs anyone's-browser-independent: this is the "background" path. Minimal deps: 
 """
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -49,11 +50,18 @@ def _k8s(method, path, body=None, subresource=""):
     return r.json()
 
 
+def _safe_name(s):
+    """A valid metadata.generateName prefix: lowercase alnum + '-', from an arbitrary alert title
+    (which may carry spaces, colons, em-dashes, …). k8s 422s on anything else."""
+    slug = re.sub(r"[^a-z0-9-]+", "-", (s or "alert").lower()).strip("-")[:40].strip("-")
+    return slug or "alert"
+
+
 def create_report(alert_name, alert_ns, alert_state, alert_id, prompt):
     ns = alert_ns or NAMESPACE
     body = {
         "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
-        "metadata": {"generateName": f"{(alert_name or 'alert')[:40]}-".lower().replace('_', '-')},
+        "metadata": {"generateName": f"{_safe_name(alert_name)}-"},
         "spec": {"alertName": alert_name or "", "alertNamespace": ns, "alertState": alert_state or "ALERT",
                  "hyperdxAlertId": alert_id or "", "prompt": prompt, "triggeredAt": _now()},
     }
