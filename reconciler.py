@@ -93,8 +93,8 @@ def run_forever():
     print(f"[reconciler] started (interval={INTERVAL}s, hyperdx={url})", flush=True)
     while True:
         try:
-            if not hdx.sid and not hdx.login():
-                print("[reconciler] login failed; retrying next cycle", flush=True)
+            if not hdx.sid and not hdx.ensure_session():
+                print("[reconciler] auth (register/login) failed; retrying next cycle", flush=True)
             elif hdx.sid:
                 reconcile_once(hdx)
         except requests.HTTPError as e:
