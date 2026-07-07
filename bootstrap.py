@@ -15,11 +15,16 @@ Auth notes (verified against ClickStack v2.27):
   * HyperDX is configured with FRONTEND_URL=http://localhost:3000, so passport failures 302 to
     http://localhost:3000/login?err=authFail — unreachable from inside the pod. We DON'T follow
     redirects; we read the status + Location to decide success, so a bad login never crashes us.
+  * On success login/register return 303 + `set-cookie: connect.sid=...; Domain=localhost` (from
+    FRONTEND_URL). No HTTP client will send a Domain=localhost cookie back to the in-cluster
+    service host, so the cookie jar stays empty and /api/team 401s. We therefore extract the
+    connect.sid value from the raw Set-Cookie header and send it EXPLICITLY on /api/team.
 
 Idempotent + retry-friendly (Job backoffLimit covers HyperDX still booting). No human, no UI.
 """
 import json
 import os
+import re
 import time
 
 import requests
@@ -43,6 +48,15 @@ def _auth_ok(r):
     return r.ok
 
 
+def _sid_from(resp):
+    """Pull connect.sid out of the raw Set-Cookie header. The cookie is scoped Domain=localhost
+    (FRONTEND_URL), so requests' jar won't replay it to the service host — we send it by hand."""
+    if resp is None:
+        return None
+    m = re.search(r"connect\.sid=([^;]+)", resp.headers.get("set-cookie", ""))
+    return m.group(1) if m else None
+
+
 def wait_for_hyperdx(session, tries=30):
     """HyperDX may still be booting when the Job starts — poll /api/installation."""
     for i in range(tries):
@@ -58,29 +72,33 @@ def wait_for_hyperdx(session, tries=30):
 
 
 def register(session):
-    """Create the first admin + team. Zod requires email + password + matching confirmPassword."""
+    """Create the first admin + team. Zod requires email + password + matching confirmPassword.
+    Returns the (successful) response so main can lift the session cookie, else None."""
     body = {"email": EMAIL, "password": PASSWORD, "confirmPassword": PASSWORD}
     r = session.post(f"{HDX}/api/register/password", json=body, timeout=30, allow_redirects=False)
     if not _auth_ok(r):
         print(f"[register] {r.status_code} loc={r.headers.get('Location', '')!r} "
               f"body={r.text[:300]!r}", flush=True)
-        return False
-    return True
+        return None
+    return r
 
 
 def login(session):
-    """passport local — try the email field, fall back to username. No redirect-follow."""
+    """passport local — try the email field, fall back to username. No redirect-follow.
+    Returns the (successful) response so main can lift the session cookie, else None."""
     for body in ({"email": EMAIL, "password": PASSWORD}, {"username": EMAIL, "password": PASSWORD}):
         r = session.post(f"{HDX}/api/login/password", json=body, timeout=30, allow_redirects=False)
         if _auth_ok(r):
-            return True
+            return r
         print(f"[login] {r.status_code} loc={r.headers.get('Location', '')!r} "
               f"body={r.text[:150]!r}", flush=True)
-    return False
+    return None
 
 
-def get_api_key(session):
-    r = session.get(f"{HDX}/api/team", timeout=30, allow_redirects=False)
+def get_api_key(session, sid):
+    # Send connect.sid explicitly (Domain=localhost keeps it out of the jar — see module docstring).
+    headers = {"Cookie": f"connect.sid={sid}"} if sid else {}
+    r = session.get(f"{HDX}/api/team", headers=headers, timeout=30, allow_redirects=False)
     if 300 <= r.status_code < 400:
         raise SystemExit(f"/api/team redirected to {r.headers.get('Location', '')!r} — not authenticated")
     r.raise_for_status()
@@ -115,19 +133,28 @@ def write_secret(token):
 
 
 def main():
-    s = requests.Session()  # cookie jar carries the passport session across calls
+    s = requests.Session()
     if wait_for_hyperdx(s):
         print("team exists -> logging in", flush=True)
-        if not login(s):
+        resp = login(s)
+        if not resp:
             raise SystemExit(f"login failed for {EMAIL}")
     else:
         print(f"no team -> registering first admin {EMAIL}", flush=True)
-        if not register(s):
+        resp = register(s)
+        if not resp:
             # someone registered between our check and now -> fall back to login
             print("register failed; trying login", flush=True)
-            if not login(s):
+            resp = login(s)
+            if not resp:
                 raise SystemExit(f"register and login both failed for {EMAIL}")
-    key = get_api_key(s)
+    sid = _sid_from(resp)
+    if not sid:
+        # auth response carried no cookie -> do an explicit login to obtain a fresh session
+        print("no connect.sid on auth response; performing explicit login", flush=True)
+        resp = login(s)
+        sid = _sid_from(resp)
+    key = get_api_key(s, sid)
     write_secret(key)
     print(f"[ok] wrote Secret {NAMESPACE}/{SECRET_NAME} ({len(key)} chars)", flush=True)
 
