@@ -9,11 +9,17 @@ endpoints with a session cookie jar:
   GET  /api/team                         -> team.apiKey  (the /api/v2 access key)
   -> write it into the `hyperdx-api-token` Secret (apiserver, via the mounted SA token).
 
+Auth notes (verified against ClickStack v2.27):
+  * register enforces a Zod policy: password >= 12 chars incl. upper+lower+digit+special, AND a
+    matching `confirmPassword` field. The admin-creds Secret must satisfy this.
+  * HyperDX is configured with FRONTEND_URL=http://localhost:3000, so passport failures 302 to
+    http://localhost:3000/login?err=authFail — unreachable from inside the pod. We DON'T follow
+    redirects; we read the status + Location to decide success, so a bad login never crashes us.
+
 Idempotent + retry-friendly (Job backoffLimit covers HyperDX still booting). No human, no UI.
 """
 import json
 import os
-import sys
 import time
 
 import requests
@@ -25,6 +31,16 @@ NAMESPACE = os.environ.get("NAMESPACE", "krateo-system")
 SECRET_NAME = os.environ.get("SECRET_NAME", "hyperdx-api-token")
 SA = "/var/run/secrets/kubernetes.io/serviceaccount"
 APISERVER = os.environ.get("APISERVER", "https://kubernetes.default.svc")
+
+
+def _auth_ok(r):
+    """passport/register success = a 2xx, or a 3xx whose Location is NOT an error redirect
+    (failures 302 to .../login?err=authFail). We never follow the redirect (it points at
+    the unreachable FRONTEND_URL localhost:3000)."""
+    loc = r.headers.get("Location", "")
+    if 300 <= r.status_code < 400:
+        return "err" not in loc and "authFail" not in loc
+    return r.ok
 
 
 def wait_for_hyperdx(session, tries=30):
@@ -41,17 +57,32 @@ def wait_for_hyperdx(session, tries=30):
     raise SystemExit("HyperDX /api/installation never became ready")
 
 
+def register(session):
+    """Create the first admin + team. Zod requires email + password + matching confirmPassword."""
+    body = {"email": EMAIL, "password": PASSWORD, "confirmPassword": PASSWORD}
+    r = session.post(f"{HDX}/api/register/password", json=body, timeout=30, allow_redirects=False)
+    if not _auth_ok(r):
+        print(f"[register] {r.status_code} loc={r.headers.get('Location', '')!r} "
+              f"body={r.text[:300]!r}", flush=True)
+        return False
+    return True
+
+
 def login(session):
-    """passport local — try the email field, fall back to username."""
+    """passport local — try the email field, fall back to username. No redirect-follow."""
     for body in ({"email": EMAIL, "password": PASSWORD}, {"username": EMAIL, "password": PASSWORD}):
-        r = session.post(f"{HDX}/api/login/password", json=body, timeout=30)
-        if r.ok:
-            return
-    raise SystemExit(f"login failed for {EMAIL}: {r.status_code} {r.text[:200]}")
+        r = session.post(f"{HDX}/api/login/password", json=body, timeout=30, allow_redirects=False)
+        if _auth_ok(r):
+            return True
+        print(f"[login] {r.status_code} loc={r.headers.get('Location', '')!r} "
+              f"body={r.text[:150]!r}", flush=True)
+    return False
 
 
 def get_api_key(session):
-    r = session.get(f"{HDX}/api/team", timeout=30)
+    r = session.get(f"{HDX}/api/team", timeout=30, allow_redirects=False)
+    if 300 <= r.status_code < 400:
+        raise SystemExit(f"/api/team redirected to {r.headers.get('Location', '')!r} — not authenticated")
     r.raise_for_status()
     team = r.json()
     if isinstance(team, list):
@@ -87,14 +118,15 @@ def main():
     s = requests.Session()  # cookie jar carries the passport session across calls
     if wait_for_hyperdx(s):
         print("team exists -> logging in", flush=True)
-        login(s)
+        if not login(s):
+            raise SystemExit(f"login failed for {EMAIL}")
     else:
         print(f"no team -> registering first admin {EMAIL}", flush=True)
-        r = s.post(f"{HDX}/api/register/password", json={"email": EMAIL, "password": PASSWORD}, timeout=30)
-        if not r.ok:
+        if not register(s):
             # someone registered between our check and now -> fall back to login
-            print(f"register returned {r.status_code}; trying login", flush=True)
-            login(s)
+            print("register failed; trying login", flush=True)
+            if not login(s):
+                raise SystemExit(f"register and login both failed for {EMAIL}")
     key = get_api_key(s)
     write_secret(key)
     print(f"[ok] wrote Secret {NAMESPACE}/{SECRET_NAME} ({len(key)} chars)", flush=True)
