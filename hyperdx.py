@@ -21,6 +21,13 @@ def _unwrap(x):
     return x["data"] if isinstance(x, dict) and "data" in x else x
 
 
+# HyperDX compiles a generic webhook's `body` as a Handlebars template to build the POST payload;
+# a webhook with NO body makes handleSendGenericWebhook throw ("Handlebars.compile(undefined)") and
+# every notification silently fails. {{title}} is the alert title (single-line -> JSON-safe once
+# Handlebars HTML-escapes quotes); the handler reads alertName from it.
+DEFAULT_WEBHOOK_BODY = '{"alertName":"{{title}}","state":"ALERT","source":"hyperdx-alert"}'
+
+
 class HyperDXError(RuntimeError):
     pass
 
@@ -101,14 +108,24 @@ class HyperDX:
             raise HyperDXError("no HyperDX sources configured")
         return srcs[0]
 
-    def ensure_webhook(self, name, target_url, service="generic", description=""):
+    def ensure_webhook(self, name, target_url, service="generic", description="", body=None):
+        """Ensure a generic webhook named `name` exists WITH a body template. Returns
+        (webhookId, recreated). A pre-existing body-less webhook is deleted and recreated (its send
+        would otherwise 500), so callers must re-point alerts when recreated is True."""
+        body = body or DEFAULT_WEBHOOK_BODY
         for w in (self._req("GET", f"/api/webhooks?service={service}") or []):
             if w.get("name") == name:
-                return w["_id"]
+                if w.get("body"):
+                    return w["_id"], False
+                self._req("DELETE", f"/api/webhooks/{w['_id']}")  # body-less -> recreate with body
+                break
         created = self._req("POST", "/api/webhooks",
                             {"name": name, "service": service, "url": target_url,
-                             "description": description or name})
-        return created["_id"]
+                             "description": description or name, "body": body})
+        return created["_id"], True
+
+    def delete_alert(self, alert_id):
+        self._req("DELETE", f"/api/alerts/{alert_id}")
 
     def ensure_dashboard_tile(self, name, source, where=""):
         """Ensure a single-tile dashboard `name` counting rows of `source` matching `where`.

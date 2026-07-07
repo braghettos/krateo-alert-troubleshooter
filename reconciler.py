@@ -66,8 +66,21 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
 
 def reconcile_once(hdx):
     source = hdx.first_source()
-    webhook_id = hdx.ensure_webhook(WEBHOOK_NAME, WEBHOOK_TARGET,
-                                    description="Krateo Autopilot auto-troubleshooter")
+    webhook_id, recreated = hdx.ensure_webhook(WEBHOOK_NAME, WEBHOOK_TARGET,
+                                               description="Krateo Autopilot auto-troubleshooter")
+    if recreated:
+        # the webhook id changed -> alerts referencing the old id would notify a dead channel.
+        # Drop the HyperDX alerts we manage + reset their CR status so they rebuild on this webhook.
+        crs = _list_alert_crs()
+        managed = {cr.get("status", {}).get("hyperdxAlertId") for cr in crs} - {None, ""}
+        for a in hdx.list_alerts():
+            if a["_id"] in managed:
+                try:
+                    hdx.delete_alert(a["_id"])
+                except Exception:  # noqa: BLE001
+                    pass
+        for cr in crs:
+            _patch_status(cr["metadata"]["name"], {"hyperdxAlertId": None, "phase": "Pending"})
     for cr in _list_alert_crs():
         try:
             _reconcile_cr(hdx, cr, source, webhook_id)
