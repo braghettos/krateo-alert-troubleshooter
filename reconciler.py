@@ -17,6 +17,7 @@ in the krateo-alert-troubleshooter process:
 Alerts flow: HyperDX evaluates the alert; when it fires it POSTs the webhook -> this service's
 /webhook -> Autopilot RCA -> TroubleshootingReport. The reconciler only manages config + status.
 """
+import json
 import os
 import time
 
@@ -31,8 +32,41 @@ INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "60"))
 WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "krateo-autopilot")
 WEBHOOK_TARGET = os.environ.get(
     "WEBHOOK_TARGET_URL", "http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook")
+# Default Alert CRs to seed on startup (JSON array of specs+name). The composition ships these here
+# rather than as chart CRs — Helm can't validate a CR before its CRD is installed in the same pass.
+DEFAULT_ALERTS_JSON = os.environ.get("DEFAULT_ALERTS_JSON", "")
 # Added to each Alert CR so its HyperDX alert+dashboard are removed before the CR is deleted.
 FINALIZER = "observability.krateo.io/hyperdx-cleanup"
+
+
+def seed_default_alerts():
+    """Create the default Alert CRs (from DEFAULT_ALERTS_JSON) if absent. Returns True once done (or
+    nothing to seed); False if the Alert CRD isn't established yet, so the caller retries next cycle."""
+    if not DEFAULT_ALERTS_JSON:
+        return True
+    try:
+        defaults = json.loads(DEFAULT_ALERTS_JSON)
+    except (ValueError, TypeError) as e:
+        print(f"[reconciler] bad DEFAULT_ALERTS_JSON ({e}); skipping seed", flush=True)
+        return True
+    try:
+        existing = {cr["metadata"]["name"] for cr in _list_alert_crs()}
+    except Exception as e:  # noqa: BLE001 — CRD not ready yet
+        print(f"[reconciler] seed: Alert CRD not ready ({str(e)[:80]}); retrying", flush=True)
+        return False
+    for a in defaults:
+        name = a.get("name")
+        if not name or name in existing:
+            continue
+        body = {"apiVersion": f"{GROUP}/{VERSION}", "kind": "Alert",
+                "metadata": {"name": name, "namespace": NAMESPACE},
+                "spec": {k: v for k, v in a.items() if k != "name"}}
+        try:
+            _k8s("POST", f"/apis/{GROUP}/{VERSION}/namespaces/{NAMESPACE}/{PLURAL}", body)
+            print(f"[reconciler] seeded default Alert {name}", flush=True)
+        except Exception as e:  # noqa: BLE001 — one bad seed shouldn't block the rest
+            print(f"[reconciler] seed {name} failed: {str(e)[:120]}", flush=True)
+    return True
 
 
 def _list_alert_crs():
@@ -140,8 +174,11 @@ def run_forever():
         return
     hdx = hyperdx.HyperDX(url, email, password)
     print(f"[reconciler] started (interval={INTERVAL}s, hyperdx={url})", flush=True)
+    seeded = False
     while True:
         try:
+            if not seeded:
+                seeded = seed_default_alerts()  # k8s-only; retries until the Alert CRD is ready
             if not hdx.sid and not hdx.ensure_session():
                 print("[reconciler] auth (register/login) failed; retrying next cycle", flush=True)
             elif hdx.sid:

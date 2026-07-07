@@ -17,10 +17,10 @@ rules:
   - apiGroups: ["observability.krateo.io"]
     resources: ["troubleshootingreports", "troubleshootingreports/status"]
     verbs: ["create", "get", "list", "patch", "update"]
-  # the reconciler reads Alert CRs (desired) and writes their status (mirrored HyperDX state)
+  # the reconciler reads Alert CRs (desired), seeds defaults, and writes their status
   - apiGroups: ["observability.krateo.io"]
     resources: ["alerts", "alerts/status"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
   # the key-bootstrap Job (same SA) writes the hyperdx-api-token Secret
   - apiGroups: [""]
     resources: ["secrets"]
@@ -76,6 +76,9 @@ spec:
               valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: password } }
             - name: RECONCILE_INTERVAL
               value: "60"
+            # default Alert CRs seeded by the reconciler (not shipped as CRs — CRD-order safe)
+            - name: DEFAULT_ALERTS_JSON
+              value: '[{"name":"error-log-volume","displayName":"Error log volume","where":"SeverityText:error OR SeverityText:Error OR SeverityText:ERROR","interval":"5m","threshold":1,"thresholdType":"above","message":"Error-log volume is elevated — Autopilot will auto-triage the root cause."},{"name":"warning-log-volume","displayName":"Warning log volume","where":"SeverityText:warn OR SeverityText:warning OR SeverityText:WARN","interval":"15m","threshold":25,"thresholdType":"above","message":"Warning-log volume crossed the threshold — Autopilot will summarise likely causes."}]'
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 3
