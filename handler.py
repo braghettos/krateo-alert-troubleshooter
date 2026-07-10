@@ -107,7 +107,7 @@ def a2a_analyze(prompt):
     body = {"id": 1, "jsonrpc": "2.0", "method": "message/stream", "params": {"message": {
         "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
         "parts": [{"kind": "text", "text": prompt}]}}}
-    out = []
+    out = ""
     with requests.post(AUTOPILOT_A2A, json=body, stream=True, timeout=A2A_TIMEOUT,
                        headers={"Accept": "text/event-stream", "Content-Type": "application/json"}) as resp:
         resp.raise_for_status()
@@ -120,11 +120,21 @@ def a2a_analyze(prompt):
                 continue
             result = payload.get("result") or {}
             msg = result.get("status", {}).get("message") or result.get("message") or {}
-            if msg.get("role") == "agent":
-                for part in msg.get("parts", []):
-                    if part.get("kind") == "text" and part.get("text"):
-                        out.append(part["text"])
-    return "".join(out).strip()
+            if msg.get("role") != "agent":
+                continue
+            text = "".join(p["text"] for p in msg.get("parts", [])
+                           if p.get("kind") == "text" and p.get("text"))
+            if not text:
+                continue
+            # kagent's A2A stream re-sends cumulative snapshots of the message (and repeats the
+            # final one), so blindly appending every event duplicated the whole report. Replace
+            # when the new text extends what we already have (a snapshot), skip an exact-duplicate
+            # tail, else append (a genuine delta) — correct for snapshot-, delta-, and repeat streams.
+            if text.startswith(out):
+                out = text
+            elif not out.endswith(text):
+                out += text
+    return out.strip()
 
 
 def build_prompt(alert_name, alert_state):
