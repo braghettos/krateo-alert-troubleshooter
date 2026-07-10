@@ -189,11 +189,16 @@ def build_prompt(alert_name, alert_state, where=None, message=None):
         scope = (
             f"\n\nThis alert fired because log records matched the query `{where}`"
             + (f" (intent: {message})" if message else "")
-            + ". Those SPECIFIC matching logs are what tripped it. ROOT-CAUSE THAT signal: read the "
-            "error logs matching this query, identify which workload/component emits them and WHY, and "
-            "diagnose that. Do NOT substitute a different, louder problem elsewhere on the cluster; if "
-            "you cannot read the specific logs behind this alert (e.g. a telemetry tool is unavailable), "
-            "SAY SO rather than reporting an unrelated component's issue as this alert's root cause."
+            + ". Those SPECIFIC matching logs are what tripped it. ROOT-CAUSE THAT signal:\n"
+            "1. Find the matching logs by their BODY as the query specifies — do NOT additionally "
+            "require a severity level (this pipeline often leaves SeverityText empty, so a severity "
+            "filter will wrongly return nothing) — to see WHICH workload/namespace emits them.\n"
+            "2. Then inspect THAT workload's Kubernetes state directly (k8s_get_resources): pod status "
+            "and recent events — CrashLoopBackOff, OOMKilled, restart counts, connection errors. The "
+            "workload's k8s state is AUTHORITATIVE even when the logs are hard to query.\n"
+            "Diagnose the workload this alert points at. Do NOT substitute a different, louder problem "
+            "elsewhere on the cluster. Only if you can determine NEITHER the matching logs NOR the "
+            "workload's k8s state should you say you cannot find the cause."
         )
     return (
         f"A HyperDX observability alert \"{alert_name}\" has fired (state {alert_state}) on this "
