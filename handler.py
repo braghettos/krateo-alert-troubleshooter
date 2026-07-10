@@ -65,12 +65,21 @@ def _safe_name(s):
 RUN_COUNT_ANNO = "observability.krateo.io/run-count"
 FIRST_RUN_ANNO = "observability.krateo.io/first-run-at"
 LAST_RUN_ANNO = "observability.krateo.io/last-run-at"
+CONTEXT_ID_ANNO = "observability.krateo.io/context-id"
 
 
 def _stable_name(alert_name):
     """One DETERMINISTIC report CR per alert (upserted), so a re-firing alert bumps a run-count on
     the SAME report instead of piling up a new near-identical report every cooldown window."""
     return f"report-{_safe_name(alert_name)}"[:63].rstrip("-")
+
+
+def _context_id(alert_name):
+    """A DETERMINISTIC A2A contextId per alert (uuid5 of the stable report name), so every RCA run
+    of the SAME alert continues ONE kagent conversation thread rather than opening a fresh one each
+    time — and the portal can deep-link to that per-alert thread. Two DIFFERENT alerts get two
+    distinct contextIds (two threads). Stable across restarts."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, _stable_name(alert_name)))
 
 
 def _get_report(ns, name):
@@ -82,14 +91,16 @@ def _get_report(ns, name):
         raise
 
 
-def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing):
+def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing, context_id=""):
     """Create the alert's report (run-count=1) or bump the existing one (run-count++, last-run=now),
-    setting phase=Analyzing. Run info lives in annotations — no TroubleshootingReport CRD change."""
+    setting phase=Analyzing. Run info + the per-alert kagent context id live in annotations — no
+    TroubleshootingReport CRD change."""
     if existing is None:
         body = {
             "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
             "metadata": {"name": name,
-                         "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now}},
+                         "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now,
+                                         CONTEXT_ID_ANNO: context_id}},
             "spec": {"alertName": alert_name or "", "alertNamespace": ns, "alertState": alert_state or "ALERT",
                      "hyperdxAlertId": alert_id or "", "prompt": prompt, "triggeredAt": now},
         }
@@ -101,7 +112,8 @@ def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, exi
         except (ValueError, TypeError):
             count = 1
         _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}",
-             {"metadata": {"annotations": {RUN_COUNT_ANNO: str(count), LAST_RUN_ANNO: now}},
+             {"metadata": {"annotations": {RUN_COUNT_ANNO: str(count), LAST_RUN_ANNO: now,
+                                           CONTEXT_ID_ANNO: context_id}},
               "spec": {"alertState": alert_state or "ALERT", "triggeredAt": now}})
     patch_status(ns, name, {"phase": "Analyzing"})
 
@@ -148,11 +160,15 @@ def _alert_where(alert_name, ns):
     return None, None
 
 
-def a2a_analyze(prompt):
-    """POST JSON-RPC message/stream to the Autopilot A2A agent; accumulate the agent's text."""
-    body = {"id": 1, "jsonrpc": "2.0", "method": "message/stream", "params": {"message": {
-        "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
-        "parts": [{"kind": "text", "text": prompt}]}}}
+def a2a_analyze(prompt, context_id=None):
+    """POST JSON-RPC message/stream to the Autopilot A2A agent; accumulate the agent's text.
+    A stable `context_id` continues ONE kagent thread across re-runs of the same alert (omitted =
+    a fresh thread)."""
+    message = {"kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+               "parts": [{"kind": "text", "text": prompt}]}
+    if context_id:
+        message["contextId"] = context_id
+    body = {"id": 1, "jsonrpc": "2.0", "method": "message/stream", "params": {"message": message}}
     out = ""
     with requests.post(AUTOPILOT_A2A, json=body, stream=True, timeout=A2A_TIMEOUT,
                        headers={"Accept": "text/event-stream", "Content-Type": "application/json"}) as resp:
@@ -219,6 +235,7 @@ def process(payload):
     where, message = _alert_where(alert_name, alert_ns)  # scope the RCA to what actually tripped
     prompt = build_prompt(alert_name, alert_state, where, message)
     name = _stable_name(alert_name)
+    ctx = _context_id(alert_name)  # stable per-alert kagent thread (one thread across re-runs)
     now = _now()
     # One report CR per alert, upserted under a lock: re-fires within the cooldown are skipped;
     # otherwise the same CR is re-analyzed and its run-count bumped — no pile-up of duplicate reports.
@@ -227,9 +244,9 @@ def process(payload):
         if _within_cooldown(existing):
             print(f"[dedup] {alert_name!r} analyzed recently / in-flight; skipping", flush=True)
             return
-        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing)
+        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing, ctx)
     try:
-        report = a2a_analyze(prompt) or "_Autopilot returned no analysis._"
+        report = a2a_analyze(prompt, ctx) or "_Autopilot returned no analysis._"
         patch_status(alert_ns, name, {"phase": "Ready", "report": report, "completedAt": _now()})
         print(f"[ok] report {alert_ns}/{name} ready ({len(report)} chars)", flush=True)
     except Exception as e:  # noqa: BLE001 — record the failure on the CR
