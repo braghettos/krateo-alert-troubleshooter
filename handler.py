@@ -62,44 +62,90 @@ def _safe_name(s):
     return slug or "alert"
 
 
-def create_report(alert_name, alert_ns, alert_state, alert_id, prompt):
-    ns = alert_ns or NAMESPACE
-    body = {
-        "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
-        "metadata": {"generateName": f"{_safe_name(alert_name)}-"},
-        "spec": {"alertName": alert_name or "", "alertNamespace": ns, "alertState": alert_state or "ALERT",
-                 "hyperdxAlertId": alert_id or "", "prompt": prompt, "triggeredAt": _now()},
-    }
-    obj = _k8s("POST", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}", body)
-    name = obj["metadata"]["name"]
+RUN_COUNT_ANNO = "observability.krateo.io/run-count"
+FIRST_RUN_ANNO = "observability.krateo.io/first-run-at"
+LAST_RUN_ANNO = "observability.krateo.io/last-run-at"
+
+
+def _stable_name(alert_name):
+    """One DETERMINISTIC report CR per alert (upserted), so a re-firing alert bumps a run-count on
+    the SAME report instead of piling up a new near-identical report every cooldown window."""
+    return f"report-{_safe_name(alert_name)}"[:63].rstrip("-")
+
+
+def _get_report(ns, name):
+    try:
+        return _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}")
+    except requests.HTTPError as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 404:
+            return None
+        raise
+
+
+def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing):
+    """Create the alert's report (run-count=1) or bump the existing one (run-count++, last-run=now),
+    setting phase=Analyzing. Run info lives in annotations — no TroubleshootingReport CRD change."""
+    if existing is None:
+        body = {
+            "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
+            "metadata": {"name": name,
+                         "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now}},
+            "spec": {"alertName": alert_name or "", "alertNamespace": ns, "alertState": alert_state or "ALERT",
+                     "hyperdxAlertId": alert_id or "", "prompt": prompt, "triggeredAt": now},
+        }
+        _k8s("POST", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}", body)
+    else:
+        anns = (existing.get("metadata") or {}).get("annotations") or {}
+        try:
+            count = int(anns.get(RUN_COUNT_ANNO, "0")) + 1
+        except (ValueError, TypeError):
+            count = 1
+        _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}",
+             {"metadata": {"annotations": {RUN_COUNT_ANNO: str(count), LAST_RUN_ANNO: now}},
+              "spec": {"alertState": alert_state or "ALERT", "triggeredAt": now}})
     patch_status(ns, name, {"phase": "Analyzing"})
-    return ns, name
 
 
 def patch_status(ns, name, status):
     _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}", {"status": status}, subresource="status")
 
 
-def _recent_report(alert_name, ns):
-    """Dedup: True if a report for this alert is still Pending/Analyzing, or was created within
-    REPORT_COOLDOWN seconds. Keeps a perpetually-breached alert from spawning a report every eval."""
-    try:
-        items = _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}").get("items", [])
-    except Exception:  # noqa: BLE001 — on a list error, don't block the report
+def _within_cooldown(report):
+    """Dedup: True if this alert's report is mid-analysis, or was last run within REPORT_COOLDOWN —
+    so a perpetually-breached alert re-analyzes at most once per window (bumping its run-count then)."""
+    if not report:
         return False
-    now = datetime.now(timezone.utc)
-    for r in items:
-        if (r.get("spec") or {}).get("alertName") != alert_name:
-            continue
-        if (r.get("status") or {}).get("phase") in ("Pending", "Analyzing"):
+    if ((report.get("status") or {}).get("phase")) in ("Pending", "Analyzing"):
+        return True
+    anns = (report.get("metadata") or {}).get("annotations") or {}
+    ts = anns.get(LAST_RUN_ANNO) or (report.get("metadata") or {}).get("creationTimestamp")
+    try:
+        if ts and (datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() < REPORT_COOLDOWN:
             return True
-        ts = r.get("metadata", {}).get("creationTimestamp")
-        try:
-            if ts and (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() < REPORT_COOLDOWN:
-                return True
-        except ValueError:
-            pass
+    except (ValueError, AttributeError):
+        pass
     return False
+
+
+def _alert_where(alert_name, ns):
+    """Look up the fired Alert CR (observability.krateo.io) matching the webhook alertName, to SCOPE
+    the RCA to what actually tripped: its `spec.where` query + `message`. Match on the alphanumeric
+    core — the HyperDX alert title may carry an emoji/prefix the CR displayName doesn't."""
+    def norm(s):
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    target = norm(alert_name)
+    if not target:
+        return None, None
+    try:
+        alerts = _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/alerts").get("items", [])
+    except Exception:  # noqa: BLE001 — best-effort; fall back to an unscoped prompt
+        return None, None
+    for a in alerts:
+        spec = a.get("spec") or {}
+        disp = norm(spec.get("displayName") or (a.get("metadata") or {}).get("name", ""))
+        if disp and (disp in target or target in disp):
+            return spec.get("where"), spec.get("message")
+    return None, None
 
 
 def a2a_analyze(prompt):
@@ -137,13 +183,23 @@ def a2a_analyze(prompt):
     return out.strip()
 
 
-def build_prompt(alert_name, alert_state):
+def build_prompt(alert_name, alert_state, where=None, message=None):
+    scope = ""
+    if where:
+        scope = (
+            f"\n\nThis alert fired because log records matched the query `{where}`"
+            + (f" (intent: {message})" if message else "")
+            + ". Those SPECIFIC matching logs are what tripped it. ROOT-CAUSE THAT signal: read the "
+            "error logs matching this query, identify which workload/component emits them and WHY, and "
+            "diagnose that. Do NOT substitute a different, louder problem elsewhere on the cluster; if "
+            "you cannot read the specific logs behind this alert (e.g. a telemetry tool is unavailable), "
+            "SAY SO rather than reporting an unrelated component's issue as this alert's root cause."
+        )
     return (
         f"A HyperDX observability alert \"{alert_name}\" has fired (state {alert_state}) on this "
-        "Krateo PlatformOps cluster. Perform an END-TO-END troubleshooting root-cause analysis: "
-        "inspect the platform's reconcile-failure rate, per-composition reconcile latency, the grouped "
-        "error-log digest, recent error/warning logs, and pod resource pressure. Identify the single "
-        "most likely root cause, name the affected composition(s) or component(s), and give concrete, "
+        "Krateo PlatformOps cluster." + scope +
+        "\n\nPerform a focused root-cause analysis of what triggered THIS alert: identify the single "
+        "most likely root cause, name the affected composition(s)/component(s), and give concrete, "
         "ordered remediation steps. Be concise and actionable; use short markdown sections."
     )
 
@@ -155,20 +211,25 @@ def process(payload):
     alert_id = payload.get("id") or payload.get("alertId") or (payload.get("alert") or {}).get("id") or ""
     alert_state = payload.get("state") or payload.get("status") or "ALERT"
     alert_ns = payload.get("alertNamespace") or NAMESPACE
-    prompt = build_prompt(alert_name, alert_state)
-    # Dedup under a lock: skip if a report for this alert is in-flight or within the cooldown.
+    where, message = _alert_where(alert_name, alert_ns)  # scope the RCA to what actually tripped
+    prompt = build_prompt(alert_name, alert_state, where, message)
+    name = _stable_name(alert_name)
+    now = _now()
+    # One report CR per alert, upserted under a lock: re-fires within the cooldown are skipped;
+    # otherwise the same CR is re-analyzed and its run-count bumped — no pile-up of duplicate reports.
     with _create_lock:
-        if _recent_report(alert_name, alert_ns):
-            print(f"[dedup] recent/in-flight report for {alert_name!r}; skipping", flush=True)
+        existing = _get_report(alert_ns, name)
+        if _within_cooldown(existing):
+            print(f"[dedup] {alert_name!r} analyzed recently / in-flight; skipping", flush=True)
             return
-        ns, name = create_report(alert_name, alert_ns, alert_state, alert_id, prompt)
+        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing)
     try:
         report = a2a_analyze(prompt) or "_Autopilot returned no analysis._"
-        patch_status(ns, name, {"phase": "Ready", "report": report, "completedAt": _now()})
-        print(f"[ok] report {ns}/{name} ready ({len(report)} chars)", flush=True)
+        patch_status(alert_ns, name, {"phase": "Ready", "report": report, "completedAt": _now()})
+        print(f"[ok] report {alert_ns}/{name} ready ({len(report)} chars)", flush=True)
     except Exception as e:  # noqa: BLE001 — record the failure on the CR
-        patch_status(ns, name, {"phase": "Failed", "error": str(e)[:500], "completedAt": _now()})
-        print(f"[err] report {ns}/{name} failed: {e}", flush=True)
+        patch_status(alert_ns, name, {"phase": "Failed", "error": str(e)[:500], "completedAt": _now()})
+        print(f"[err] report {alert_ns}/{name} failed: {e}", flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
