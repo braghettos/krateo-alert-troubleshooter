@@ -2,6 +2,12 @@
 # by the alert-troubleshooter handler when a HyperDX alert fires. spec captures what triggered
 # it (the firing alert + the prompt); status holds the Autopilot analysis (markdown) + phase.
 # The portal Alerts section lists these and shows the report per alert.
+#
+# v2 (structured investigation, all fields OPTIONAL — v1 prose-only reports stay valid):
+# spec.trigger says WHAT started the investigation; status carries the machine-readable
+# investigation the agent produced (what it read, the evidence, an evidence-cited reasoning
+# trace, the root cause, and a remediation PLAN — recorded only, never executed here) plus a
+# lifecycle (open/mitigated/resolved) the frontend/applySet flow will advance later.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -28,6 +34,9 @@ spec:
         - name: Phase
           type: string
           jsonPath: .status.phase
+        - name: Lifecycle
+          type: string
+          jsonPath: .status.lifecycle
         - name: Triggered
           type: string
           jsonPath: .spec.triggeredAt
@@ -50,6 +59,12 @@ spec:
                 alertState:
                   type: string
                   description: The alert state that triggered this (usually ALERT).
+                trigger:
+                  type: string
+                  enum: [alert, composition-condition, user-ask]
+                  description: >-
+                    What started this investigation. The HyperDX webhook flow sets "alert";
+                    composition-condition and user-ask are reserved for future entry points.
                 prompt:
                   type: string
                   description: The troubleshooting prompt sent to the Autopilot agent.
@@ -73,6 +88,122 @@ spec:
                   type: string
                 completedAt:
                   type: string
+                # ---- v2 structured investigation (all optional; absent on v1 reports) ----
+                lifecycle:
+                  type: string
+                  enum: [open, mitigated, resolved]
+                  description: >-
+                    Incident lifecycle of THIS report (distinct from phase, which tracks the
+                    analysis run). New reports open as "open"; mitigated/resolved are advanced
+                    by the remediation flow, not by this reconciler.
+                auditRecordRefs:
+                  type: array
+                  description: References to audit records of actions taken on this report (empty for now).
+                  items:
+                    type: string
+                analyzedResources:
+                  type: array
+                  description: The cluster objects the agent actually read during the RCA.
+                  items:
+                    type: object
+                    properties:
+                      gvr:
+                        type: string
+                        description: group/version/resource, e.g. apps/v1/deployments.
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      whatWasRead:
+                        type: string
+                        description: What of the object was inspected (status, events, spec, ...).
+                sources:
+                  type: array
+                  description: >-
+                    The evidence the analysis rests on. reasoningTrace steps cite entries here
+                    by 0-based index (evidenceRefs).
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                        enum: [logs, events, metrics, object]
+                      ref:
+                        type: string
+                        description: Where the evidence came from (query, object ref, metric name).
+                      excerpt:
+                        type: string
+                        description: The relevant excerpt of the evidence, verbatim.
+                missingContext:
+                  type: array
+                  description: What the agent could NOT see but would have wanted to (honest gaps).
+                  items:
+                    type: string
+                assumptions:
+                  type: array
+                  description: Assumptions the analysis makes because of the missing context.
+                  items:
+                    type: string
+                reasoningTrace:
+                  type: array
+                  description: Ordered reasoning steps, each citing the sources it rests on.
+                  items:
+                    type: object
+                    properties:
+                      step:
+                        type: integer
+                        description: 1-based position of this step.
+                      statement:
+                        type: string
+                      evidenceRefs:
+                        type: array
+                        description: 0-based indices into status.sources backing this statement.
+                        items:
+                          type: integer
+                rootCause:
+                  type: object
+                  properties:
+                    statement:
+                      type: string
+                    confidence:
+                      type: string
+                      description: Confidence 0-1 as a decimal string (e.g. "0.85").
+                    category:
+                      type: string
+                      description: Failure class (config, capacity, image, network, dependency, ...).
+                remediationPlan:
+                  type: array
+                  description: >-
+                    The ordered remediation PLAN. The troubleshooter only RECORDS it; execution
+                    (and filling observedOutcome) belongs to the frontend/applySet flow.
+                  items:
+                    type: object
+                    properties:
+                      description:
+                        type: string
+                      verb:
+                        type: string
+                        description: The intended write (patch, apply, delete, scale, restart, ...).
+                      gvr:
+                        type: string
+                        description: group/version/resource of the target.
+                      target:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                      payload:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                        description: The patch/apply body to submit (shape depends on verb+target).
+                      successCriterion:
+                        type: string
+                        description: How to tell this step worked.
+                      observedOutcome:
+                        type: string
+                        description: Filled in after the step is applied; empty until then.
                 conditions:
                   type: array
                   items:

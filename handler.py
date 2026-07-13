@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
+import report_v2  # the structured-report (v2) contract: prompt instructions + defensive parser
+
 # --- config (env, with in-cluster defaults) ---
 NAMESPACE = os.environ.get("NAMESPACE", "krateo-system")
 AUTOPILOT_A2A = os.environ.get("AUTOPILOT_A2A_URL", "http://krateo-autopilot.krateo-system.svc:8080/")
@@ -102,6 +104,7 @@ def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, exi
                          "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now,
                                          CONTEXT_ID_ANNO: context_id}},
             "spec": {"alertName": alert_name or "", "alertNamespace": ns, "alertState": alert_state or "ALERT",
+                     "trigger": "alert",  # this flow IS the alert entry point (v2 enum)
                      "hyperdxAlertId": alert_id or "", "prompt": prompt, "triggeredAt": now},
         }
         _k8s("POST", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}", body)
@@ -114,7 +117,7 @@ def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, exi
         _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}",
              {"metadata": {"annotations": {RUN_COUNT_ANNO: str(count), LAST_RUN_ANNO: now,
                                            CONTEXT_ID_ANNO: context_id}},
-              "spec": {"alertState": alert_state or "ALERT", "triggeredAt": now}})
+              "spec": {"alertState": alert_state or "ALERT", "trigger": "alert", "triggeredAt": now}})
     patch_status(ns, name, {"phase": "Analyzing"})
 
 
@@ -222,6 +225,7 @@ def build_prompt(alert_name, alert_state, where=None, message=None):
         "\n\nPerform a focused root-cause analysis of what triggered THIS alert: identify the single "
         "most likely root cause, name the affected composition(s)/component(s), and give concrete, "
         "ordered remediation steps. Be concise and actionable; use short markdown sections."
+        + report_v2.STRUCTURED_OUTPUT_INSTRUCTIONS
     )
 
 
@@ -246,9 +250,19 @@ def process(payload):
             return
         _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing, ctx)
     try:
-        report = a2a_analyze(prompt, ctx) or "_Autopilot returned no analysis._"
-        patch_status(alert_ns, name, {"phase": "Ready", "report": report, "completedAt": _now()})
-        print(f"[ok] report {alert_ns}/{name} ready ({len(report)} chars)", flush=True)
+        raw = a2a_analyze(prompt, ctx)
+        # v2: split the answer into prose + the structured investigation. Parsing is defensive —
+        # a missing/malformed JSON block degrades to a prose-only (v1) report, never a crash.
+        prose, v2 = report_v2.parse_structured_report(raw)
+        status = {"phase": "Ready", "report": prose or "_Autopilot returned no analysis._",
+                  "completedAt": _now(), "lifecycle": "open", "auditRecordRefs": []}
+        # Latest-run-wins: ALWAYS send every v2 key — parsed value, or None (JSON null, which
+        # merge-patch DELETES) so a re-run that lost structure also clears the stale previous one.
+        for k in report_v2.V2_STATUS_KEYS:
+            status[k] = v2.get(k)
+        patch_status(alert_ns, name, status)
+        print(f"[ok] report {alert_ns}/{name} ready ({len(prose)} chars prose, "
+              f"structured={'yes' if v2 else 'no'})", flush=True)
     except Exception as e:  # noqa: BLE001 — record the failure on the CR
         patch_status(alert_ns, name, {"phase": "Failed", "error": str(e)[:500], "completedAt": _now()})
         print(f"[err] report {alert_ns}/{name} failed: {e}", flush=True)
