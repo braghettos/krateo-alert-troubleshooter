@@ -213,3 +213,22 @@ class TestHandlerWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestYamlThenJsonFixture(unittest.TestCase):
+    """Regression: a ```yaml example BEFORE the ```json block must not break extraction
+    (live 2026-07-14: the yaml closer mis-paired as a json opener; the valid structured
+    block was never parsed)."""
+
+    def test_live_reply_with_yaml_block_parses_structured(self):
+        import os
+        fixture = os.path.join(os.path.dirname(__file__), "fixtures", "reply_yaml_then_json.txt")
+        with open(fixture) as f:
+            raw = f.read()
+        prose, v2 = report_v2.parse_structured_report(raw)
+        self.assertTrue(v2, "structured block must parse")
+        self.assertTrue((v2.get("rootCause") or {}).get("statement"))
+        self.assertTrue(v2.get("remediationPlan"))
+        # the yaml example stays in the prose; the json block is stripped
+        self.assertIn("```yaml", prose)
+        self.assertNotIn('"remediationPlan"', prose)

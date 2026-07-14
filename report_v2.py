@@ -58,7 +58,35 @@ Hard rules for this block:
   outcomes out; they are recorded later.
 - Output STRICT JSON (double quotes, no comments, no trailing commas)."""
 
-_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\n(.*?)\n?[ \t]*```", re.DOTALL)
+# Fence LINES (```lang or bare ```), walked as sequential open/close PAIRS. A single
+# pairing regex mis-pairs when a non-json block precedes (a ```yaml example's CLOSING
+# fence looks like a bare opener and swallows the prose up to the real ```json opener —
+# seen live 2026-07-14: a full valid structured block was never extracted). The walker
+# pairs fences in order and yields only blocks whose OPENER language is json/blank.
+_FENCE_LINE_RE = re.compile(r"^```([A-Za-z0-9_-]*)[ \t]*\r?$", re.MULTILINE)
+
+
+class _BlockSpan:
+    """Minimal match-like span (start/end of the WHOLE fenced block, opener to closer)."""
+
+    def __init__(self, start, end, body):
+        self._start, self._end, self.body = start, end, body
+
+    def start(self):
+        return self._start
+
+    def end(self):
+        return self._end
+
+
+def _fenced_blocks(text):
+    """(span, body) for each properly PAIRED fenced block, in document order."""
+    fences = list(_FENCE_LINE_RE.finditer(text))
+    for i in range(0, len(fences) - 1, 2):
+        opener, closer = fences[i], fences[i + 1]
+        lang = (opener.group(1) or "").lower()
+        body = text[opener.end():closer.start()].strip("\n")
+        yield lang, _BlockSpan(opener.start(), closer.end(), body)
 
 
 def _s(v, limit=4096):
@@ -181,14 +209,16 @@ def _plan(v):
 
 
 def _candidate_blocks(text):
-    """Fenced code blocks that parse as a JSON object mentioning ≥1 v2 key, best (last) first."""
-    for m in reversed(list(_FENCE_RE.finditer(text))):
+    """json/blank-language fenced blocks that parse as a JSON object mentioning ≥1 v2 key,
+    best (last) first."""
+    blocks = [(lang, span) for lang, span in _fenced_blocks(text) if lang in ("", "json")]
+    for lang, span in reversed(blocks):
         try:
-            data = json.loads(m.group(1))
+            data = json.loads(span.body)
         except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(data, dict) and any(k in data for k in V2_STATUS_KEYS + ("rootCause",)):
-            yield m, data
+            yield span, data
 
 
 def parse_structured_report(text):
