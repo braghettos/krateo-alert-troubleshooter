@@ -254,6 +254,19 @@ def process(payload):
         # v2: split the answer into prose + the structured investigation. Parsing is defensive —
         # a missing/malformed JSON block degrades to a prose-only (v1) report, never a crash.
         prose, v2 = report_v2.parse_structured_report(raw)
+        # KEEP-LAST-GOOD: an EMPTY analysis (no prose AND no structure) is a FAILED run, not a
+        # result — never let it overwrite a previous good investigation (seen live 2026-07-14:
+        # an empty A2A reply wiped a full structured RCA to "Autopilot returned no analysis").
+        # Record the failed re-run on the CR without touching report/v2 fields.
+        if not prose.strip() and not v2:
+            existing_now = _get_report(alert_ns, name) or {}
+            had_analysis = bool(((existing_now.get("status") or {}).get("report") or "").strip()) \
+                or bool((existing_now.get("status") or {}).get("rootCause"))
+            if had_analysis:
+                patch_status(alert_ns, name, {"phase": "Ready",
+                                              "error": f"re-analysis at {_now()} returned no output; kept previous analysis"})
+                print(f"[warn] report {alert_ns}/{name}: empty analysis — kept previous (keep-last-good)", flush=True)
+                return
         status = {"phase": "Ready", "report": prose or "_Autopilot returned no analysis._",
                   "completedAt": _now(), "lifecycle": "open", "auditRecordRefs": []}
         # Latest-run-wins: ALWAYS send every v2 key — parsed value, or None (JSON null, which
