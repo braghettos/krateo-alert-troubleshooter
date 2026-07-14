@@ -202,7 +202,19 @@ def a2a_analyze(prompt, context_id=None):
     return out.strip()
 
 
-def build_prompt(alert_name, alert_state, where=None, message=None):
+def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False):
+    # RE-RUNS: the stable per-alert kagent thread makes the agent 'remember' its previous
+    # answer and short-circuit ('I already analyzed this') — which parses to NOTHING and
+    # starves re-analysis (seen live 2026-07-14: every post-first run returned 0 chars).
+    # Force a complete fresh pass while keeping the thread (rail continuity).
+    rerun_preamble = ""
+    if rerun:
+        rerun_preamble = (
+            "RE-ANALYSIS REQUEST: this alert has fired again. Do NOT refer to, summarize, or "
+            "defer to your previous answers in this conversation. Re-verify against the CURRENT "
+            "cluster and telemetry state from scratch, and output the COMPLETE analysis again — "
+            "including the full structured JSON block — as if this were the first request.\n\n"
+        )
     scope = ""
     if where:
         scope = (
@@ -219,7 +231,7 @@ def build_prompt(alert_name, alert_state, where=None, message=None):
             "elsewhere on the cluster. Only if you can determine NEITHER the matching logs NOR the "
             "workload's k8s state should you say you cannot find the cause."
         )
-    return (
+    return rerun_preamble + (
         f"A HyperDX observability alert \"{alert_name}\" has fired (state {alert_state}) on this "
         "Krateo PlatformOps cluster." + scope +
         "\n\nPerform a focused root-cause analysis of what triggered THIS alert: identify the single "
@@ -237,7 +249,7 @@ def process(payload):
     alert_state = payload.get("state") or payload.get("status") or "ALERT"
     alert_ns = payload.get("alertNamespace") or NAMESPACE
     where, message = _alert_where(alert_name, alert_ns)  # scope the RCA to what actually tripped
-    prompt = build_prompt(alert_name, alert_state, where, message)
+    prompt = None  # built after the dedup gate, when we know if this is a re-run
     name = _stable_name(alert_name)
     ctx = _context_id(alert_name)  # stable per-alert kagent thread (one thread across re-runs)
     now = _now()
@@ -248,11 +260,13 @@ def process(payload):
         if _within_cooldown(existing):
             print(f"[dedup] {alert_name!r} analyzed recently / in-flight; skipping", flush=True)
             return
+        prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing))
         _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing, ctx)
     try:
         raw = a2a_analyze(prompt, ctx)
         # v2: split the answer into prose + the structured investigation. Parsing is defensive —
         # a missing/malformed JSON block degrades to a prose-only (v1) report, never a crash.
+        print(f"[a2a] raw reply: {len(raw)} chars", flush=True)
         prose, v2 = report_v2.parse_structured_report(raw)
         # KEEP-LAST-GOOD: an EMPTY analysis (no prose AND no structure) is a FAILED run, not a
         # result — never let it overwrite a previous good investigation (seen live 2026-07-14:
