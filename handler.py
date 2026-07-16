@@ -30,6 +30,18 @@ A2A_TIMEOUT = int(os.environ.get("A2A_TIMEOUT", "180"))
 # HyperDX notifies every eval while an alert stays breached; dedup so we don't spam a new report
 # each interval. Skip if one for the same alert is in-flight, or was created within this window.
 REPORT_COOLDOWN = int(os.environ.get("REPORT_COOLDOWN", "1800"))
+# The per-alert kagent A2A thread is continued (same contextId) across re-runs for rail/deep-link
+# continuity, but each re-run forces a COMPLETE fresh RCA (build_prompt rerun=True) that re-pulls ALL
+# telemetry (logs + k8s dumps) into that ONE thread. Over many fires the thread's accumulated
+# tool-call history grows without bound and eventually overflows the model's input-token window
+# (seen live 2026-07-16: 95 runs on one thread -> 1,097,807 tokens > Gemini's 1,048,576 limit -> the
+# provider 400s and the RCA can no longer run at all). So the thread is ROTATED every
+# CONTEXT_MAX_RUNS runs: the contextId is keyed on a run-count "epoch", so after this many runs a
+# fresh empty thread opens and the accumulated context resets. Continuity is preserved within a
+# window; no analysis quality is lost across a rotation because the next run re-derives everything
+# from scratch anyway. At a conservative ~15k tokens of telemetry per run, 10 runs ~= 150k tokens --
+# an order of magnitude under the limit, with ample headroom for a verbose run.
+CONTEXT_MAX_RUNS = max(1, int(os.environ.get("CONTEXT_MAX_RUNS", "10")))
 
 _create_lock = threading.Lock()  # serialize the dedup-check + create so simultaneous fires don't race
 
@@ -76,12 +88,19 @@ def _stable_name(alert_name):
     return f"report-{_safe_name(alert_name)}"[:63].rstrip("-")
 
 
-def _context_id(alert_name):
-    """A DETERMINISTIC A2A contextId per alert (uuid5 of the stable report name), so every RCA run
-    of the SAME alert continues ONE kagent conversation thread rather than opening a fresh one each
-    time — and the portal can deep-link to that per-alert thread. Two DIFFERENT alerts get two
-    distinct contextIds (two threads). Stable across restarts."""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, _stable_name(alert_name)))
+def _context_id(alert_name, run_count=0):
+    """A DETERMINISTIC A2A contextId per alert (uuid5 of the stable report name + a run-count epoch),
+    so RCA runs of the SAME alert continue ONE kagent conversation thread for rail/deep-link
+    continuity — but that thread is ROTATED every CONTEXT_MAX_RUNS runs so its accumulated telemetry
+    can never overflow the model's input-token window. Two DIFFERENT alerts get two distinct threads;
+    the same alert gets a fresh thread each epoch. Deterministic + stable across restarts (the epoch
+    is derived from the report's persisted run-count, not from process state).
+
+    run_count is the count of THIS run (1-based). Epoch = (run_count - 1) // CONTEXT_MAX_RUNS, so
+    runs 1..N share epoch 0, runs N+1..2N share epoch 1, etc. — each epoch a clean, empty thread."""
+    epoch = max(0, (int(run_count) - 1)) // CONTEXT_MAX_RUNS
+    seed = _stable_name(alert_name) if epoch == 0 else f"{_stable_name(alert_name)}#e{epoch}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
 
 def _get_report(ns, name):
@@ -91,6 +110,19 @@ def _get_report(ns, name):
         if getattr(getattr(e, "response", None), "status_code", None) == 404:
             return None
         raise
+
+
+def _next_run_count(existing):
+    """The 1-based count of the run about to start: previous run-count + 1, or 1 for a first-ever
+    report. Kept consistent with the increment in _upsert_report so the rotated contextId's epoch
+    matches the run-count the report is stamped with."""
+    if existing is None:
+        return 1
+    anns = (existing.get("metadata") or {}).get("annotations") or {}
+    try:
+        return int(anns.get(RUN_COUNT_ANNO, "0")) + 1
+    except (ValueError, TypeError):
+        return 1
 
 
 def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing, context_id=""):
@@ -251,7 +283,6 @@ def process(payload):
     where, message = _alert_where(alert_name, alert_ns)  # scope the RCA to what actually tripped
     prompt = None  # built after the dedup gate, when we know if this is a re-run
     name = _stable_name(alert_name)
-    ctx = _context_id(alert_name)  # stable per-alert kagent thread (one thread across re-runs)
     now = _now()
     # One report CR per alert, upserted under a lock: re-fires within the cooldown are skipped;
     # otherwise the same CR is re-analyzed and its run-count bumped — no pile-up of duplicate reports.
@@ -260,6 +291,11 @@ def process(payload):
         if _within_cooldown(existing):
             print(f"[dedup] {alert_name!r} analyzed recently / in-flight; skipping", flush=True)
             return
+        # THIS run's 1-based count = previous run-count + 1 (1 for a first-ever report). The kagent
+        # thread is keyed on it so the thread rotates every CONTEXT_MAX_RUNS runs — bounding the
+        # accumulated telemetry well under the model's input-token limit.
+        run_count = _next_run_count(existing)
+        ctx = _context_id(alert_name, run_count)  # per-alert thread, rotated every CONTEXT_MAX_RUNS
         prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing))
         _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing, ctx)
     try:
