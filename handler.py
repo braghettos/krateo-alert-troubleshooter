@@ -125,19 +125,32 @@ def _next_run_count(existing):
         return 1
 
 
-def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing, context_id=""):
+def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
+                   context_id="", alert_ref="", alert_namespace=""):
     """Create the alert's report (run-count=1) or bump the existing one (run-count++, last-run=now),
     setting phase=Analyzing. Run info + the per-alert kagent context id live in annotations — no
-    TroubleshootingReport CRD change."""
+    TroubleshootingReport CRD change.
+
+    The join keys (hyperdxAlertId / alertRef / alertNamespace) are sourced from the MATCHED Alert CR
+    (not the unreliable webhook payload) so the portal can join incident→alert by a robust HyperDX id
+    or a deterministic /alerts/{ns}/{name} slug — never the fragile emoji displayName. They're set on
+    every run (create AND patch), since a first run may not have found the Alert yet."""
+    join = {"alertState": alert_state or "ALERT", "trigger": "alert", "triggeredAt": now}
+    if alert_id:
+        join["hyperdxAlertId"] = alert_id          # robust ID join to the Alert's status.hyperdxAlertId
+    if alert_ref:
+        join["alertRef"] = alert_ref               # the Alert's metadata.name slug → /alerts/{ns}/{name}
+    if alert_namespace:
+        join["alertNamespace"] = alert_namespace   # the Alert CR's real namespace (not just the report's)
     if existing is None:
         body = {
             "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
             "metadata": {"name": name,
                          "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now,
                                          CONTEXT_ID_ANNO: context_id}},
-            "spec": {"alertName": alert_name or "", "alertNamespace": ns, "alertState": alert_state or "ALERT",
-                     "trigger": "alert",  # this flow IS the alert entry point (v2 enum)
-                     "hyperdxAlertId": alert_id or "", "prompt": prompt, "triggeredAt": now},
+            "spec": ({"alertName": alert_name or "",
+                      # default alertNamespace to the report's ns; a matched Alert overrides below
+                      "alertNamespace": ns, "prompt": prompt} | join),
         }
         _k8s("POST", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}", body)
     else:
@@ -149,7 +162,7 @@ def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, exi
         _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}",
              {"metadata": {"annotations": {RUN_COUNT_ANNO: str(count), LAST_RUN_ANNO: now,
                                            CONTEXT_ID_ANNO: context_id}},
-              "spec": {"alertState": alert_state or "ALERT", "trigger": "alert", "triggeredAt": now}})
+              "spec": join})
     patch_status(ns, name, {"phase": "Analyzing"})
 
 
@@ -174,25 +187,30 @@ def _within_cooldown(report):
     return False
 
 
-def _alert_where(alert_name, ns):
-    """Look up the fired Alert CR (observability.krateo.io) matching the webhook alertName, to SCOPE
-    the RCA to what actually tripped: its `spec.where` query + `message`. Match on the alphanumeric
-    core — the HyperDX alert title may carry an emoji/prefix the CR displayName doesn't."""
+def _match_alert(alert_name, ns):
+    """Look up the fired Alert CR (observability.krateo.io) matching the webhook alertName. The
+    webhook payload's own id/name is unreliable (often empty on the live CR, and the title carries
+    an emoji/prefix the CR's metadata.name/displayName don't), so we match on the alphanumeric core
+    against BOTH the Alert's metadata.name AND spec.displayName — the same normalized key the portal
+    incidents-list uses — and return the whole matched Alert CR. Returns None if no match / on error
+    (best-effort; the caller degrades to an unscoped prompt with no robust id-join)."""
     def norm(s):
         return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
     target = norm(alert_name)
     if not target:
-        return None, None
+        return None
     try:
         alerts = _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/alerts").get("items", [])
     except Exception:  # noqa: BLE001 — best-effort; fall back to an unscoped prompt
-        return None, None
+        return None
     for a in alerts:
-        spec = a.get("spec") or {}
-        disp = norm(spec.get("displayName") or (a.get("metadata") or {}).get("name", ""))
-        if disp and (disp in target or target in disp):
-            return spec.get("where"), spec.get("message")
-    return None, None
+        meta, spec = a.get("metadata") or {}, a.get("spec") or {}
+        name = norm(meta.get("name", ""))
+        disp = norm(spec.get("displayName", ""))
+        if (name and (name in target or target in name)) or \
+           (disp and (disp in target or target in disp)):
+            return a
+    return None
 
 
 def a2a_analyze(prompt, context_id=None):
@@ -280,7 +298,18 @@ def process(payload):
     alert_id = payload.get("id") or payload.get("alertId") or (payload.get("alert") or {}).get("id") or ""
     alert_state = payload.get("state") or payload.get("status") or "ALERT"
     alert_ns = payload.get("alertNamespace") or NAMESPACE
-    where, message = _alert_where(alert_name, alert_ns)  # scope the RCA to what actually tripped
+    # Resolve the fired Alert CR ONCE: it scopes the RCA (spec.where/message) AND carries the robust
+    # join keys the report needs (status.hyperdxAlertId + metadata.name/namespace). The webhook
+    # payload's own id is unreliable (empty on the live CR), so the Alert CR's status is authoritative.
+    matched = _match_alert(alert_name, alert_ns)
+    m_spec = (matched or {}).get("spec") or {}
+    m_meta = (matched or {}).get("metadata") or {}
+    m_status = (matched or {}).get("status") or {}
+    where, message = (m_spec.get("where"), m_spec.get("message")) if matched else (None, None)
+    # Robust join keys from the Alert CR (fall back to the webhook payload's id when unmatched):
+    alert_id = m_status.get("hyperdxAlertId") or alert_id     # ID join → Alert.status.hyperdxAlertId
+    alert_ref = m_meta.get("name", "")                        # stable slug → /alerts/{ns}/{name}
+    alert_namespace = m_meta.get("namespace") or alert_ns     # the Alert CR's real namespace
     prompt = None  # built after the dedup gate, when we know if this is a re-run
     name = _stable_name(alert_name)
     now = _now()
@@ -297,7 +326,8 @@ def process(payload):
         run_count = _next_run_count(existing)
         ctx = _context_id(alert_name, run_count)  # per-alert thread, rotated every CONTEXT_MAX_RUNS
         prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing))
-        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing, ctx)
+        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
+                       ctx, alert_ref=alert_ref, alert_namespace=alert_namespace)
     try:
         raw = a2a_analyze(prompt, ctx)
         # v2: split the answer into prose + the structured investigation. Parsing is defensive —

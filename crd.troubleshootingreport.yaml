@@ -53,9 +53,18 @@ spec:
               properties:
                 alertName:
                   type: string
-                  description: The firing HyperDX alert (Alert CR) name.
+                  description: >-
+                    The firing HyperDX alert's DISPLAY name (may carry an emoji/prefix). Human-facing
+                    only — do NOT join on this; use alertRef (stable slug) or hyperdxAlertId instead.
+                alertRef:
+                  type: string
+                  description: >-
+                    The triggering Alert CR's metadata.name (a stable DNS slug, distinct from the
+                    emoji displayName in alertName). Lets consumers build a deterministic
+                    /alerts/{alertNamespace}/{alertRef} deep-link instead of a fragile name match.
                 alertNamespace:
                   type: string
+                  description: Namespace of the triggering Alert CR (defaults to this report's namespace).
                 alertState:
                   type: string
                   description: The alert state that triggered this (usually ALERT).
@@ -73,7 +82,10 @@ spec:
                   description: When the webhook fired (RFC3339).
                 hyperdxAlertId:
                   type: string
-                  description: HyperDX-internal alert id from the webhook payload.
+                  description: >-
+                    HyperDX-internal alert id, sourced from the triggering Alert CR's
+                    status.hyperdxAlertId (the webhook payload's own id is often empty). Enables a
+                    robust id-based incident↔alert join independent of any name matching.
             status:
               type: object
               properties:
