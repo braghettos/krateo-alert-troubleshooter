@@ -43,7 +43,7 @@ after it) containing a machine-readable summary of the SAME investigation, with 
   "assumptions": ["what you assumed because of that"],
   "reasoningTrace": [{"step": 1, "statement": "...", "evidenceRefs": [0]}],
   "rootCause": {"statement": "...", "confidence": 0.85, "category": "config|capacity|image|network|dependency|other"},
-  "remediationPlan": [{"description": "...", "verb": "patch|apply|delete|scale|restart", "gvr": "apps/v1/deployments", "target": {"name": "...", "namespace": "..."}, "payload": {}, "successCriterion": "how to verify it worked"}]
+  "remediationPlan": [{"description": "Provision payments-db database", "verb": "apply", "gvr": "apps/v1/deployments", "target": {"name": "payments-db", "namespace": "payments"}, "payload": {}, "successCriterion": "Endpoints/payments-db in namespace payments lists active pod IPs on port 5432"}]
 }
 
 Hard rules for this block:
@@ -56,6 +56,10 @@ Hard rules for this block:
 - confidence is 0 to 1. remediationPlan is a PLAN only — it will not be executed automatically;
   order the steps, and make each successCriterion independently checkable. Leave observed
   outcomes out; they are recorded later.
+- remediationPlan[].description MUST be a SHORT imperative phrase, ≤60 chars, no trailing period
+  (e.g. "Restart payments-api deployment", "Provision payments-db database"). Do NOT put constraints,
+  namespaces, ports, or labels in description — those belong in successCriterion. Never repeat
+  the description text inside successCriterion.
 - Output STRICT JSON (double quotes, no comments, no trailing commas)."""
 
 # Fence LINES (```lang or bare ```), walked as sequential open/close PAIRS. A single
