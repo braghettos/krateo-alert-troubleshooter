@@ -213,6 +213,12 @@ spec:
                       successCriterion:
                         type: string
                         description: How to tell this step worked.
+                      verifyCommand:
+                        type: string
+                        description: kubectl command that verifies the successCriterion.
+                      sourceRef:
+                        type: integer
+                        description: 0-based index into status.sources[] explaining why this step is needed.
                       observedOutcome:
                         type: string
                         description: Filled in after the step is applied; empty until then.

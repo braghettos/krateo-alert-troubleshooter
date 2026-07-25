@@ -43,7 +43,7 @@ after it) containing a machine-readable summary of the SAME investigation, with 
   "assumptions": ["what you assumed because of that"],
   "reasoningTrace": [{"step": 1, "statement": "...", "evidenceRefs": [0]}],
   "rootCause": {"statement": "...", "confidence": 0.85, "category": "config|capacity|image|network|dependency|other"},
-  "remediationPlan": [{"description": "Provision payments-db database", "verb": "apply", "gvr": "apps/v1/deployments", "target": {"name": "payments-db", "namespace": "payments"}, "payload": {}, "successCriterion": "Endpoints/payments-db in namespace payments lists active pod IPs on port 5432"}]
+  "remediationPlan": [{"description": "Provision payments-db database", "verb": "apply", "gvr": "apps/v1/deployments", "target": {"name": "payments-db", "namespace": "payments"}, "payload": {}, "successCriterion": "Endpoints/payments-db in namespace payments lists active pod IPs on port 5432", "verifyCommand": "kubectl get endpoints payments-db -n payments", "sourceRef": 2}]
 }
 
 Hard rules for this block:
@@ -60,6 +60,12 @@ Hard rules for this block:
   (e.g. "Restart payments-api deployment", "Provision payments-db database"). Do NOT put constraints,
   namespaces, ports, or labels in description — those belong in successCriterion. Never repeat
   the description text inside successCriterion.
+- remediationPlan[].verifyCommand MUST be a single kubectl command (no shell pipes, no &&) that
+  lets an operator check the successCriterion (e.g. "kubectl get endpoints payments-db -n payments").
+  Omit if no single kubectl command captures the check.
+- remediationPlan[].sourceRef MUST be the 0-based index into "sources" of the evidence that best
+  explains WHY this step is needed. Required for every step — pick the closest match if none is
+  perfect.
 - Output STRICT JSON (double quotes, no comments, no trailing commas)."""
 
 # Fence LINES (```lang or bare ```), walked as sequential open/close PAIRS. A single
@@ -198,7 +204,7 @@ def _plan(v):
     if not isinstance(v, list):
         return out
     for x in v[:32]:
-        o = _obj(x, ("description", "verb", "gvr", "successCriterion"))
+        o = _obj(x, ("description", "verb", "gvr", "successCriterion", "verifyCommand"))
         if not o or "description" not in o:
             continue
         target = _obj(x.get("target"), ("name", "namespace"))
@@ -207,6 +213,13 @@ def _plan(v):
         payload = x.get("payload")
         if isinstance(payload, dict) and payload:
             o["payload"] = payload  # CRD: object + x-kubernetes-preserve-unknown-fields
+        sr = x.get("sourceRef")
+        if isinstance(sr, bool):
+            sr = None
+        elif isinstance(sr, float) and sr.is_integer():
+            sr = int(sr)
+        if isinstance(sr, int) and sr >= 0:
+            o["sourceRef"] = sr
         o["observedOutcome"] = ""  # filled post-apply by the remediation flow, never here
         out.append(o)
     return out
