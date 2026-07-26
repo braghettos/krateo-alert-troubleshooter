@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Session-driven reconciler for Alert CRs (alerts.observability.krateo.io).
+"""Bearer-auth reconciler for Alert CRs (alerts.observability.krateo.io).
 
-Replaces KOG for HyperDX alert/webhook management (KOG can't drive the passport session this
-ClickStack version requires — see the module docstring in hyperdx.py). Runs as a background thread
-in the krateo-alert-troubleshooter process:
+Runs as a background thread in the krateo-alert-troubleshooter process:
 
   every RECONCILE_INTERVAL seconds:
-    login (once; re-login on session expiry) ->
     ensure the shared webhook (-> this troubleshooter's /webhook) ->
     for each Alert CR:
         being deleted (deletionTimestamp) -> delete its HyperDX alert+dashboard, drop the finalizer
@@ -16,6 +13,10 @@ in the krateo-alert-troubleshooter process:
 
 Alerts flow: HyperDX evaluates the alert; when it fires it POSTs the webhook -> this service's
 /webhook -> Autopilot RCA -> TroubleshootingReport. The reconciler only manages config + status.
+
+Auth: HYPERDX_ACCESS_KEY (user.accessKey from hyperdx-api-token Secret, written by the bootstrap
+Job). Calls go to HYPERDX_API_URL (krateo-clickstack-api.krateo-system.svc:8000, port 8000 =
+HyperDX Express backend) using Bearer auth against the /api/v2 external API.
 """
 import json
 import os
@@ -23,7 +24,7 @@ import time
 
 import requests
 
-import hyperdx
+import hyperdx_v2
 from handler import _k8s, _now  # reuse the apiserver helper + timestamp
 
 GROUP, VERSION, PLURAL = "observability.krateo.io", "v1alpha1", "alerts"
@@ -166,27 +167,22 @@ def reconcile_once(hdx):
 
 
 def run_forever():
-    url = os.environ.get("HYPERDX_URL", "http://krateo-clickstack.krateo-system.svc:3000")
-    email = os.environ.get("HYPERDX_ADMIN_EMAIL")
-    password = os.environ.get("HYPERDX_ADMIN_PASSWORD")
-    if not (email and password):
-        print("[reconciler] HYPERDX_ADMIN_EMAIL/PASSWORD unset — reconciler disabled", flush=True)
+    api_url = os.environ.get("HYPERDX_API_URL",
+                             "http://krateo-clickstack-api.krateo-system.svc:8000")
+    access_key = os.environ.get("HYPERDX_ACCESS_KEY")
+    if not access_key:
+        print("[reconciler] HYPERDX_ACCESS_KEY unset — reconciler disabled", flush=True)
         return
-    hdx = hyperdx.HyperDX(url, email, password)
-    print(f"[reconciler] started (interval={INTERVAL}s, hyperdx={url})", flush=True)
+    hdx = hyperdx_v2.HyperDXV2(api_url, access_key)
+    print(f"[reconciler] started (interval={INTERVAL}s, api={api_url})", flush=True)
     seeded = False
     while True:
         try:
             if not seeded:
                 seeded = seed_default_alerts()  # k8s-only; retries until the Alert CRD is ready
-            if not hdx.sid and not hdx.ensure_session():
-                print("[reconciler] auth (register/login) failed; retrying next cycle", flush=True)
-            elif hdx.sid:
-                reconcile_once(hdx)
+            reconcile_once(hdx)
         except requests.HTTPError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
-            if code in (401, 403):
-                hdx.sid = None  # session expired -> re-login next cycle
             print(f"[reconciler] http error ({code}); will retry: {e}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[reconciler] cycle error: {e}", flush=True)

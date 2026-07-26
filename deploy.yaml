@@ -67,13 +67,11 @@ spec:
               value: http://krateo-autopilot.krateo-system.svc:8080/
             - name: REPORT_COOLDOWN
               value: "1800"     # dedup window (s): don't re-analyze the same alert within this
-            # --- reconciler (Alert CRs -> HyperDX session API) ---
-            - name: HYPERDX_URL
-              value: http://krateo-clickstack.krateo-system.svc:3000
-            - name: HYPERDX_ADMIN_EMAIL
-              valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: email } }
-            - name: HYPERDX_ADMIN_PASSWORD
-              valueFrom: { secretKeyRef: { name: hyperdx-admin-creds, key: password } }
+            # --- reconciler (Alert CRs -> HyperDX v2 external API, Bearer auth) ---
+            - name: HYPERDX_API_URL
+              value: http://krateo-clickstack-api.krateo-system.svc:8000
+            - name: HYPERDX_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: hyperdx-api-token, key: accessKey } }
             - name: RECONCILE_INTERVAL
               value: "60"
             # default Alert CRs seeded by the reconciler (not shipped as CRs — CRD-order safe)
