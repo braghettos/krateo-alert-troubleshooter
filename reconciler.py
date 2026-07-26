@@ -113,7 +113,7 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
     display = spec.get("displayName") or name
     hdx_id = status.get("hyperdxAlertId")
 
-    live = {a["_id"]: a for a in hdx.list_alerts()}
+    live = {a["id"]: a for a in hdx.list_alerts()}
     if hdx_id and hdx_id in live:
         _patch_status(name, {"state": live[hdx_id].get("state", "OK"),
                              "phase": "Synced", "lastSyncedAt": _now()})
@@ -141,9 +141,9 @@ def reconcile_once(hdx):
         active = [cr for cr in _list_alert_crs() if not cr["metadata"].get("deletionTimestamp")]
         managed = {cr.get("status", {}).get("hyperdxAlertId") for cr in active} - {None, ""}
         for a in hdx.list_alerts():
-            if a["_id"] in managed:
+            if a["id"] in managed:
                 try:
-                    hdx.delete_alert(a["_id"])
+                    hdx.delete_alert(a["id"])
                 except Exception:  # noqa: BLE001
                     pass
         for cr in active:

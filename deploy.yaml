@@ -57,7 +57,7 @@ spec:
       serviceAccountName: krateo-alert-troubleshooter
       containers:
         - name: handler
-          image: ghcr.io/braghettos/krateo-alert-troubleshooter:latest
+          image: ghcr.io/braghettos/krateo-alert-troubleshooter:v0.2.15
           ports:
             - containerPort: 8080
           env:
