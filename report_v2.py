@@ -43,7 +43,10 @@ after it) containing a machine-readable summary of the SAME investigation, with 
   "assumptions": ["what you assumed because of that"],
   "reasoningTrace": [{"step": 1, "statement": "...", "evidenceRefs": [0]}],
   "rootCause": {"statement": "...", "confidence": 0.85, "category": "config|capacity|image|network|dependency|other"},
-  "remediationPlan": [{"description": "Provision payments-db database", "verb": "apply", "gvr": "apps/v1/deployments", "target": {"name": "payments-db", "namespace": "payments"}, "payload": {}, "successCriterion": "Endpoints/payments-db in namespace payments lists active pod IPs on port 5432", "verifyCommand": "kubectl get endpoints payments-db -n payments", "sourceRef": 2}]
+  "remediationPlan": [
+    {"description": "Increase memory limit for payments-api", "verb": "patch", "gvr": "apps/v1/deployments", "target": {"name": "payments-api", "namespace": "payments"}, "payload": {"spec":{"template":{"spec":{"containers":[{"name":"payments-api","image":"ghcr.io/example/payments-api:1.2.3","resources":{"limits":{"memory":"512Mi"},"requests":{"memory":"128Mi"}}}]}}}}, "successCriterion": "Deployment payments-api reports 1/1 ready replicas with no OOMKilled events", "verifyCommand": "kubectl get deployment payments-api -n payments", "sourceRef": 0},
+    {"description": "Add service exclusions to alert query", "verb": "patch", "gvr": "observability.krateo.io/v1alpha1/alerts", "target": {"name": "krateo-alert-composition-reconcile-error", "namespace": "krateo-system"}, "payload": {"spec":{"where":"Body:ReconcileError AND NOT ServiceName:krateo-observability AND NOT ServiceName:krateo-alert-troubleshooter AND NOT ServiceName:krateo-clickstack-clickhouse AND NOT ServiceName:krateo-clickstack AND NOT ServiceName:krateo-clickstack-clickhouse-clickhouse AND NOT ServiceName:clickhouse-mcp-server"}}, "successCriterion": "Alert krateo-alert-composition-reconcile-error transitions to OK state", "verifyCommand": "kubectl get alert krateo-alert-composition-reconcile-error -n krateo-system -o jsonpath='{.status.state}'", "sourceRef": 1}
+  ]
 }
 
 Hard rules for this block:
@@ -66,6 +69,26 @@ Hard rules for this block:
 - remediationPlan[].sourceRef MUST be the 0-based index into "sources" of the evidence that best
   explains WHY this step is needed. Required for every step — pick the closest match if none is
   perfect.
+- CLUSTER-SCOPED RESOURCES (v1/nodes, v1/namespaces, …): the portal write path requires a
+  namespace query parameter that cluster-scoped resources don't have. Use verb "get" ONLY for
+  nodes and other cluster-scoped kinds. Never emit verb "patch"/"apply"/"delete" for v1/nodes.
+- DEPLOYMENT CONTAINER PATCHES: a merge-patch on spec.template.spec.containers[] MUST include
+  both "name" and "image" in the payload's container entry to identify which container to update.
+  Omitting "image" causes a 422 Invalid. Fetch the current image with k8s_get_resources first,
+  then include it verbatim: {"spec":{"template":{"spec":{"containers":[{"name":"X","image":"<current>","resources":{…}}]}}}}.
+- ALERT QUERY FALSE-POSITIVES: when the root cause is a self-referential telemetry feedback loop
+  (the alert evaluator/ClickHouse/troubleshooter logs the SQL query into the log store, and those
+  log lines match the alert's own where clause), the fix is to patch the Alert CR's spec.where to
+  add NOT ServiceName: exclusions for the observability stack. Use gvr
+  "observability.krateo.io/v1alpha1/alerts", verb "patch", and payload
+  {"spec":{"where":"<original query> AND NOT ServiceName:krateo-observability AND NOT
+  ServiceName:krateo-alert-troubleshooter AND NOT ServiceName:krateo-clickstack-clickhouse AND NOT
+  ServiceName:krateo-clickstack AND NOT ServiceName:krateo-clickstack-clickhouse-clickhouse AND NOT
+  ServiceName:clickhouse-mcp-server"}}. Never target a Deployment or Composition for an alert
+  query fix — the alert rule lives in the Alert CR.
+- VERIFY WORKLOAD EXISTS before building a remediationPlan step targeting it. If a workload (pod,
+  deployment, namespace) is missing or not found when you query k8s_get_resources, do NOT produce
+  a remediationPlan step to create or provision it — report it in missingContext instead.
 - Output STRICT JSON (double quotes, no comments, no trailing commas)."""
 
 # Fence LINES (```lang or bare ```), walked as sequential open/close PAIRS. A single
