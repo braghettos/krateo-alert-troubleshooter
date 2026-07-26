@@ -95,9 +95,17 @@ def login(session):
     return None
 
 
-def get_api_key(session, sid):
-    # Send connect.sid explicitly (Domain=localhost keeps it out of the jar — see module docstring).
+def get_api_keys(session, sid):
+    """Return (team_api_key, user_access_key).
+
+    team_api_key  — from GET /api/team  (.apiKey)  — used by the legacy internal API.
+    user_access_key — from GET /api/me (.accessKey) — used by the v2 external API
+                      (/api/v2/external/alerts|webhooks|dashboards|sources) introduced in
+                      HyperDX 2.28. validateUserAccessKey checks User.findOne({accessKey}).
+    Both are stored in the Secret so consumers can migrate without a re-bootstrap.
+    """
     headers = {"Cookie": f"connect.sid={sid}"} if sid else {}
+
     r = session.get(f"{HDX}/api/team", headers=headers, timeout=30, allow_redirects=False)
     if 300 <= r.status_code < 400:
         raise SystemExit(f"/api/team redirected to {r.headers.get('Location', '')!r} — not authenticated")
@@ -105,10 +113,20 @@ def get_api_key(session, sid):
     team = r.json()
     if isinstance(team, list):
         team = team[0] if team else {}
-    key = team.get("apiKey")
-    if not key:
+    team_key = team.get("apiKey")
+    if not team_key:
         raise SystemExit(f"no apiKey in /api/team response: {json.dumps(team)[:200]}")
-    return key
+
+    r2 = session.get(f"{HDX}/api/me", headers=headers, timeout=30, allow_redirects=False)
+    if 300 <= r2.status_code < 400:
+        raise SystemExit(f"/api/me redirected — not authenticated")
+    r2.raise_for_status()
+    me = r2.json()
+    user_key = me.get("accessKey")
+    if not user_key:
+        print(f"[warn] no accessKey in /api/me response (HyperDX < 2.28?): {json.dumps(me)[:200]}", flush=True)
+
+    return team_key, user_key
 
 
 def k8s(method, path, body=None):
@@ -120,14 +138,22 @@ def k8s(method, path, body=None):
                             data=json.dumps(body) if body else None, verify=f"{SA}/ca.crt", timeout=30)
 
 
-def write_secret(token):
+def write_secret(team_key, user_key):
+    """Write (or update) the hyperdx Secret with both API keys.
+
+    token     — team.apiKey  (legacy internal API, kept for backward compat)
+    accessKey — user.accessKey (HyperDX ≥2.28 external API v2 Bearer auth)
+    """
+    string_data = {"token": team_key}
+    if user_key:
+        string_data["accessKey"] = user_key
     body = {"apiVersion": "v1", "kind": "Secret",
             "metadata": {"name": SECRET_NAME, "namespace": NAMESPACE},
-            "stringData": {"token": token}}
+            "stringData": string_data}
     r = k8s("POST", f"/api/v1/namespaces/{NAMESPACE}/secrets", body)
-    if r.status_code == 409:  # already exists -> merge-patch the token
+    if r.status_code == 409:
         k8s("PATCH", f"/api/v1/namespaces/{NAMESPACE}/secrets/{SECRET_NAME}",
-            {"stringData": {"token": token}}).raise_for_status()
+            {"stringData": string_data}).raise_for_status()
     else:
         r.raise_for_status()
 
@@ -154,9 +180,10 @@ def main():
         print("no connect.sid on auth response; performing explicit login", flush=True)
         resp = login(s)
         sid = _sid_from(resp)
-    key = get_api_key(s, sid)
-    write_secret(key)
-    print(f"[ok] wrote Secret {NAMESPACE}/{SECRET_NAME} ({len(key)} chars)", flush=True)
+    team_key, user_key = get_api_keys(s, sid)
+    write_secret(team_key, user_key)
+    keys_written = ["token"] + (["accessKey"] if user_key else [])
+    print(f"[ok] wrote Secret {NAMESPACE}/{SECRET_NAME} keys={keys_written}", flush=True)
 
 
 if __name__ == "__main__":
